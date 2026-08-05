@@ -7,7 +7,13 @@
 #include <limits>
 #include <map>
 
-#define LLAMA_MAX_EXPERTS 512  // Qwen3 Next
+// Kimi-K3 (896 routed experts). Previously 512, raised for Qwen3 Next.
+//
+// This is a pure sanity bound, not a sizing constant: it appears only here and
+// in the assert below, nothing allocates against it, and n_expert is uint32_t.
+// So the cost of raising it is zero and the value only has to stay ahead of the
+// widest MoE we intend to load.
+#define LLAMA_MAX_EXPERTS 1024
 
 static const std::map<llama_rope_scaling_type, const char *> LLAMA_ROPE_SCALING_TYPES = {
     { LLAMA_ROPE_SCALING_TYPE_NONE,   "none"   },
