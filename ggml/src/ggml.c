@@ -10298,6 +10298,9 @@ struct ggml_tensor * ggml_delta_net(
 
     GGML_ASSERT(k->ne[0] == S_k && k->ne[1] == n_tokens && k->ne[2] == H_k && k->ne[3] == n_seqs);
     GGML_ASSERT(v->ne[1] == n_tokens && v->ne[3] == n_seqs);
+    // The forget gate is either ONE scalar decay per head (Qwen3-Next's gated
+    // DeltaNet) or ONE PER CHANNEL (Kimi-K3's KDA, use_full_rank_gate=true,
+    // which ships A_log with shape [K] rather than [H]). ne[1] selects which.
     GGML_ASSERT(g->ne[0] == n_tokens && (g->ne[1] == 1 || g->ne[1] == S_v) && g->ne[2] == H_v && g->ne[3] == n_seqs);
     GGML_ASSERT(beta->ne[0] == 1 && beta->ne[1] == n_tokens && beta->ne[2] == H_v && beta->ne[3] == n_seqs);
     GGML_ASSERT(state->ne[0] == S_v && state->ne[1] == S_v * H_v && state->ne[2] == 1 && state->ne[3] == n_seqs);
@@ -24172,7 +24175,15 @@ static void ggml_compute_forward_delta_net_f32(
         GGML_ASSERT(src6->ne[0] >= (n_tokens - 1)*state_step_stride);
     }
 
-    if (iqk_fused_delta_net(head_dim, n_heads, gqa_ratio, repeat_type, n_tokens, n_seqs,
+    // A per-channel forget gate (Kimi-K3 KDA) carries head_dim decays per token
+    // instead of one. The fused kernel's signature has no way to express that -
+    // it reads g as a flat [n_tokens] run per head - so it must not be handed a
+    // full-rank gate. Fall through to the scalar reference path below, which
+    // handles both. Optimising that path is a separate exercise.
+    const bool gate_per_channel = src3->ne[1] > 1;
+
+    if (!gate_per_channel &&
+        iqk_fused_delta_net(head_dim, n_heads, gqa_ratio, repeat_type, n_tokens, n_seqs,
                 src2->nb[1]/sizeof(float), src2->nb[2]/sizeof(float), src2->nb[3]/sizeof(float),
                 q_data, k_data, v_data, g_data, beta_data, state_in,
                 out_data, state_working, saved_steps, (int) state_step_stride, ith, nth)) {
@@ -24198,7 +24209,18 @@ static void ggml_compute_forward_delta_net_f32(
         const int64_t qkv_head_offset  = batch_idx * (head_dim * n_tokens * n_heads) + head_idx * (head_dim * n_tokens);
         const int64_t qkv_head_offset_kq = batch_idx * (head_dim * n_tokens * n_heads/gqa_ratio) + head_idx_kq * (head_dim * n_tokens);
         const int64_t qkv_token_stride = head_dim;
-        const int64_t g_head_offset    = batch_idx * (n_tokens * n_heads) + head_idx * n_tokens;
+        // beta always has one value per (head, token); the gate has g_width of
+        // them - 1 for a per-head decay, head_dim for a per-channel one.
+        //
+        // The gate is [n_tokens, g_width, n_heads, n_seqs], so ne[0] is the
+        // TOKEN axis and successive channels are a whole n_tokens apart - they
+        // are not adjacent. Hence the channel stride below rather than a plain
+        // g_t[col]; it is 0 for a per-head gate, which collapses every channel
+        // read back onto the single scalar.
+        const int64_t g_width          = gate_per_channel ? head_dim : 1;
+        const int64_t g_chan_stride    = gate_per_channel ? n_tokens : 0;
+        const int64_t g_head_offset    = (batch_idx * (n_tokens * n_heads) + head_idx * n_tokens) * g_width;
+        const int64_t beta_head_offset = batch_idx * (n_tokens * n_heads) + head_idx * n_tokens;
         const int64_t state_head_offset = batch_idx * (head_dim * head_dim * n_heads) + head_idx * (head_dim * head_dim);
         const int64_t out_head_offset  = batch_idx * (head_dim * n_heads * n_tokens) + head_idx * head_dim;
         const int64_t out_token_stride = head_dim * n_heads;
@@ -24215,8 +24237,8 @@ static void ggml_compute_forward_delta_net_f32(
             const float * k_t = k_data + qkv_head_offset_kq + t * qkv_token_stride;
             const float * v_t = v_data + qkv_head_offset + t * qkv_token_stride;
 
-            const float g_val    = g_data[g_head_offset + t];
-            const float beta_raw = beta_data[g_head_offset + t];
+            const float * g_t    = g_data + g_head_offset + t;
+            const float beta_raw = beta_data[beta_head_offset + t];
 
             float q_norm_sq = 0.0f;
             float k_norm_sq = 0.0f;
@@ -24228,7 +24250,6 @@ static void ggml_compute_forward_delta_net_f32(
             const float k_norm_inv = 1.0f / sqrtf(k_norm_sq + eps);
 
             const float beta_val = 1.0f / (1.0f + expf(-beta_raw));
-            const float decay    = expf(fminf(g_val, 50.0f));
 
             float attn_score = 0.0f;
             for (int64_t i = 0; i < head_dim; ++i) {
@@ -24236,6 +24257,27 @@ static void ggml_compute_forward_delta_net_f32(
             }
 
             float * out_t = out_data + out_head_offset + t * out_token_stride;
+
+            // Apply the forget gate to the state ONCE, up front, rather than
+            // folding a scalar `decay` into each expression that reads it.
+            //
+            // For a per-head gate the two are algebraically identical (a scalar
+            // distributes over the sums below), but a per-channel gate does not
+            // factor out of `v_prime`/`out_val` at all - each column carries its
+            // own decay - so the decayed state has to be materialised first.
+            // Decay is indexed by COLUMN, the key dimension: state[row,col] is
+            // contiguous in row, so this is a scale of one contiguous run per
+            // column.
+            const float d_head = gate_per_channel ? 0.0f : expf(fminf(g_t[0], 50.0f));
+            for (int64_t col = 0; col < head_dim; ++col) {
+                const float d = gate_per_channel
+                    ? expf(fminf(g_t[col * g_chan_stride], 50.0f))
+                    : d_head;
+                float * s_col = state + col * head_dim;
+                for (int64_t row = 0; row < head_dim; ++row) {
+                    s_col[row] *= d;
+                }
+            }
 
             for (int64_t row = 0; row < head_dim; ++row) {
                 float v_prime = 0.0f;
@@ -24250,16 +24292,15 @@ static void ggml_compute_forward_delta_net_f32(
                     out_val += s * q_col;
                 }
 
-                const float v_new = v_t[row] * beta_val - v_prime * beta_val * decay * k_norm_inv;
+                const float v_new = v_t[row] * beta_val - v_prime * beta_val * k_norm_inv;
                 v_new_buf[row] = v_new;
-                out_t[row] = out_val * decay * q_norm_inv * scale + v_new * attn_score;
+                out_t[row] = out_val * q_norm_inv * scale + v_new * attn_score;
             }
 
             for (int64_t col = 0; col < head_dim; ++col) {
                 const float k_col = k_t[col] * k_norm_inv;
                 for (int64_t row = 0; row < head_dim; ++row) {
-                    float s = state[row + col * head_dim];
-                    s = decay * s + v_new_buf[row] * k_col;
+                    const float s = state[row + col * head_dim] + v_new_buf[row] * k_col;
                     state[row + col * head_dim] = fminf(fmaxf(s, -1e6f), 1e6f);
                 }
             }
