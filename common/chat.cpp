@@ -1372,7 +1372,30 @@ static common_chat_params common_chat_params_init_kimi_k3(const common_chat_temp
     data.thinking_end_tag   = THINK_CLOSE;
     data.preserved_tokens   = { "<|open|>", "<|sep|>", "<|close|>", "<|end_of_msg|>" };
 
+    // K3 does not emit JSON tool calls. It nests the same open/sep/close tags it
+    // uses for everything else, one tag per ARGUMENT, with the value as tag body:
+    //
+    //   <|open|>tools<|sep|>
+    //     <|open|>call tool="get_weather" index="1"<|sep|>
+    //       <|open|>argument key="city" type="string"<|sep|>Oslo<|close|>argument<|sep|>
+    //     <|close|>call<|sep|>
+    //   <|close|>tools<|sep|>
+    //
+    // Both `call` and `argument` carry an attribute AFTER the one we match on
+    // (index=, type=), so each opener is "prefix, name, then skip to <|sep|>"
+    // rather than the fixed prefix/suffix pair standard_constructed_tools
+    // assumes - which is why this is hand-rolled rather than using that helper.
+    const std::string SEP        = "<|sep|>";
+    const std::string TOOLS_OPEN  = "<|open|>tools<|sep|>";
+    const std::string TOOLS_CLOSE = "<|close|>tools<|sep|>";
+    const std::string CALL_OPEN   = "<|open|>call tool=\"";
+    const std::string CALL_CLOSE  = "<|close|>call<|sep|>";
+    const std::string ARG_OPEN    = "<|open|>argument key=\"";
+    const std::string ARG_CLOSE   = "<|close|>argument<|sep|>";
+
     auto extract_reasoning = inputs.reasoning_format != COMMON_REASONING_FORMAT_NONE && inputs.enable_thinking;
+    auto has_tools         = inputs.tools.is_array() && !inputs.tools.empty() &&
+                             inputs.tool_choice != COMMON_CHAT_TOOL_CHOICE_NONE;
 
     auto parser = build_chat_peg_parser([&](common_chat_peg_builder & p) -> common_peg_parser {
         // The whole reasoning block is optional: the message opener, the think
@@ -1380,8 +1403,74 @@ static common_chat_params common_chat_params_init_kimi_k3(const common_chat_temp
         auto reasoning = extract_reasoning
             ? p.optional(p.optional(p.literal(MSG_OPEN)) + THINK_OPEN + p.reasoning(p.until(THINK_CLOSE)) + THINK_CLOSE)
             : p.eps();
-        // Everything past the response close is message-level framing.
-        return reasoning << RESP_OPEN << p.content(p.until(RESP_CLOSE)) << p.rest();
+
+        // No tools: unchanged from before tool support existed. Everything past
+        // the response close is message-level framing.
+        if (!has_tools) {
+            return reasoning << RESP_OPEN << p.content(p.until(RESP_CLOSE)) << p.rest();
+        }
+
+        auto tool_choice = p.choice();
+        foreach_function(inputs.tools, [&](const json & tool) {
+            const auto & function = tool.at("function");
+            std::string  name     = function.at("name");
+            json         params   = function.contains("parameters") ? function.at("parameters") : json::object();
+
+            auto args = p.eps();
+            if (params.contains("properties") && !params["properties"].empty()) {
+                auto arg_choice = p.choice();
+                for (const auto & el : params["properties"].items()) {
+                    const std::string & prop = el.key();
+                    // The declared type decides how the body is emitted into the
+                    // arguments JSON: a string body has to be quoted and escaped,
+                    // anything else is already valid JSON (number, bool, object).
+                    std::string type = el.value().is_object() && el.value().contains("type")
+                                           ? el.value().at("type").get<std::string>()
+                                           : "string";
+                    auto body = p.until(ARG_CLOSE);
+                    auto value = type == "string" ? p.tool_arg_string_value(body) : p.tool_arg_value(body);
+
+                    arg_choice |= p.tool_arg(
+                        p.tool_arg_open(p.literal(ARG_OPEN) + p.tool_arg_name(p.literal(prop)) +
+                                        p.literal("\"") + p.until(SEP) + p.literal(SEP)) +
+                        value +
+                        p.tool_arg_close(p.literal(ARG_CLOSE)));
+                }
+                // Catch-all LAST (PEG choice is ordered): a model that emits an
+                // argument outside the schema would otherwise leave the call
+                // rule unable to reach its closer, failing the whole parse and
+                // silently dropping a tool call that was actually emitted.
+                arg_choice |= p.tool_arg(
+                    p.tool_arg_open(p.literal(ARG_OPEN) + p.tool_arg_name(p.until("\"")) +
+                                    p.literal("\"") + p.until(SEP) + p.literal(SEP)) +
+                    p.tool_arg_string_value(p.until(ARG_CLOSE)) +
+                    p.tool_arg_close(p.literal(ARG_CLOSE)));
+                args = p.zero_or_more(arg_choice + p.space());
+            }
+
+            tool_choice |= p.rule("tool-" + name,
+                p.tool(p.tool_open(p.literal(CALL_OPEN) + p.tool_name(p.literal(name)) +
+                                   p.literal("\"") + p.until(SEP) + p.literal(SEP)) +
+                       p.space() + p.tool_args(args) + p.space() +
+                       p.tool_close(p.literal(CALL_CLOSE))));
+        });
+
+        auto min_calls = inputs.tool_choice == COMMON_CHAT_TOOL_CHOICE_REQUIRED ? 1 : 0;
+        auto max_calls = inputs.parallel_tool_calls ? -1 : 1;
+        auto tools = p.trigger_rule("tool-calls",
+            p.literal(TOOLS_OPEN) + p.space() +
+            p.repeat(tool_choice + p.space(), min_calls < 1 ? 1 : min_calls, max_calls) +
+            p.optional(p.literal(TOOLS_CLOSE)));
+
+        // The response section is OPTIONAL when tools are in play. K3 usually
+        // emits an empty one before the tool block, but not always - going
+        // straight from the think section to <|open|>tools<|sep|> is normal
+        // when the turn is a pure tool call. Requiring it here failed the whole
+        // parse in exactly that case, and a failed parse silently swallows the
+        // call rather than reporting anything.
+        auto response = p.optional(p.literal(RESP_OPEN) + p.content(p.until(RESP_CLOSE)) +
+                                   p.optional(p.literal("<|close|>response<|sep|>")));
+        return reasoning << response << p.optional(tools) << p.rest();
     });
 
     data.parser = parser.save();
