@@ -354,10 +354,17 @@ ggml_tensor * llm_build_context::build_kimi_k3_kda(ggml_cgraph * gf, ggml_tensor
     const uint32_t slots = llama_kv_qnext_state_slots(lctx.kv_self);
     GGML_ASSERT(slots > 0);
 
+    // The recurrent state MUST be cleared at the start of a sequence. Passing a
+    // constant false here leaves the KDA state as whatever was in the buffer,
+    // which is exactly the kind of bug that produces fluent-shaped nonsense
+    // rather than a crash. Same rule delta_net::build_layer_attn_linear uses.
+    const bool reset_state = batch.pos != nullptr && batch.pos[0] == 0;
+    const uint32_t state_seq_id = (batch.seq_id && batch.seq_id[0]) ? (uint32_t) batch.seq_id[0][0] : 0u;
+
     ggml_tensor * out = delta_net::build_qkv(ctx0, lctx.kv_self.s_l[il], conv_w,
             qkv_mixed, lctx.inp_s_seq_qnext, beta, g,
             head_dim, n_head_kda, head_dim, n_head_kda, hparams.ssm_d_conv,
-            0, slots, false, eps, 1, il, cb, gf);
+            state_seq_id, slots, reset_state, eps, 1, il, cb, gf);
     cb(out, "kda_out", il);
 
     // ---- output gate, norm, projection ----
