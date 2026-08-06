@@ -382,12 +382,21 @@ ggml_tensor * llm_build_context::build_kimi_k3_kda(ggml_cgraph * gf, ggml_tensor
     cb(out, "kda_out", il);
 
     // ---- output gate, norm, projection ----
-    // Identical to Qwen3-Next's tail, so reuse it: per-head RMSNorm with
-    // ssm_norm, a SiLU gate from ssm_g, then the output projection.
+    // NOT delta_net::build_gated_output. That applies SiLU to the gate
+    // (silu(z) * normed) because Qwen3-Next wants it; K3 wants a plain
+    // SIGMOID. Since silu(z) = z*sigmoid(z), using the helper multiplies every
+    // KDA layer - 69 of 93 - by an extra factor of z. Nothing errors; the model
+    // just stops making sense.
     ggml_tensor * z = ggml_mul_mat(ctx0, layer.ssm_g, cur);
-    out = delta_net::build_gated_output(lctx, ctx0, layer.ssm_norm, layer.wo,
-            out, z, head_dim, n_head_kda, n_tokens, il, cb);
+    z = ggml_reshape_3d(ctx0, z, head_dim, n_head_kda, n_tokens);
+
+    out = ggml_reshape_3d(ctx0, out, head_dim, n_head_kda, n_tokens);
+    out = llm_build_norm(ctx0, out, hparams, layer.ssm_norm, nullptr, LLM_NORM_RMS, cb, il);
+    out = ggml_mul(ctx0, out, ggml_sigmoid(ctx0, z));
     cb(out, "kda_gated", il);
+
+    out = ggml_cont_2d(ctx0, out, d_inner, n_tokens);
+    out = ggml_mul_mat(ctx0, layer.wo, out);
 
     if (inp_out_ids) {
         out = ggml_get_rows(ctx0, out, inp_out_ids);
