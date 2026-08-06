@@ -372,11 +372,7 @@ ggml_tensor * llm_build_context::build_kimi_k3_kda(ggml_cgraph * gf, ggml_tensor
     // constant false here leaves the KDA state as whatever was in the buffer,
     // which is exactly the kind of bug that produces fluent-shaped nonsense
     // rather than a crash. Same rule delta_net::build_layer_attn_linear uses.
-    // KIMI_K3_ALWAYS_RESET=1 clears the recurrent state on every batch. Wrong for
-    // real generation, but decisive as a diagnostic: if the perplexity curve
-    // flattens under it, the state is leaking across sequences.
-    const bool reset_state = getenv("KIMI_K3_ALWAYS_RESET")
-                          || (batch.pos != nullptr && batch.pos[0] == 0);
+    const bool reset_state = batch.pos != nullptr && batch.pos[0] == 0;
     const uint32_t state_seq_id = (batch.seq_id && batch.seq_id[0]) ? (uint32_t) batch.seq_id[0][0] : 0u;
 
     ggml_tensor * out = delta_net::build_qkv(ctx0, lctx.kv_self.s_l[il], conv_w,
