@@ -152,10 +152,18 @@ ggml_cgraph * llm_build_context::build_kimi_k3() {
         // rather than failing (n_tokens % 1 == 0), quietly corrupting the final
         // residual on every prompt pass. AttnRes also banks full-width
         // checkpoints, so the narrowing has to happen after the last mix.
+        // KIMI_K3_SKIP_KDA / KIMI_K3_SKIP_MLA zero out one attention family so
+        // the other can be judged on its own. A model missing 24 of 93 layers
+        // should still produce roughly coherent text if the rest is sound, so
+        // this separates "which half is broken" without a reference engine.
         if (hparams.is_recurrent(il)) {
-            cur = build_kimi_k3_kda(gf, cur, nullptr, il);
+            cur = getenv("KIMI_K3_SKIP_KDA")
+                ? ggml_scale(ctx0, cur, 0.0f)
+                : build_kimi_k3_kda(gf, cur, nullptr, il);
         } else {
-            cur = build_kimi_k3_mla(gf, cur, KQ_mask, nullptr, kq_scale_mla, il);
+            cur = getenv("KIMI_K3_SKIP_MLA")
+                ? ggml_scale(ctx0, cur, 0.0f)
+                : build_kimi_k3_mla(gf, cur, KQ_mask, nullptr, kq_scale_mla, il);
         }
 
         // THE subtle line. On a banking layer the running residual RESTARTS from
