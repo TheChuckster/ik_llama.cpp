@@ -344,21 +344,11 @@ ggml_tensor * llm_build_context::build_kimi_k3_kda(ggml_cgraph * gf, ggml_tensor
     g = ggml_reshape_3d(ctx0, g, head_dim, n_head_kda, n_tokens);
 
     ggml_tensor * A = ggml_reshape_3d(ctx0, layer.ssm_a, 1, n_head_kda, 1);
-    // KIMI_K3_RAW_ALOG=1 reads ssm_a as a raw A_log rather than the pre-folded
-    // -exp(A_log). Both readings produce an all-negative tensor, so the shipped
-    // values cannot distinguish them; this is the only way to tell which
-    // convention unsloth's converter actually used.
-    if (getenv("KIMI_K3_RAW_ALOG")) {
-        A = ggml_exp(ctx0, A);                       // exp(A_log), positive
-        g = ggml_mul(ctx0, g, A);
-    } else {
-        g = ggml_mul(ctx0, g, A);                    // ssm_a == -exp(A_log)
-    }
+    // ssm_a is the PRE-FOLDED -exp(A_log), confirmed by measurement: reading it
+    // as a raw A_log instead gives PPL 148.75 against this path's 23.86.
+    g = ggml_mul(ctx0, g, A);                        // per-head scalar over 128 channels
     if (hparams.kda_gate_lower_bound > -INFINITY) {
-        if (!getenv("KIMI_K3_RAW_ALOG")) {
-            g = ggml_scale(ctx0, g, -1.0f);          // undo the folded negation
-        }
-        g = ggml_sigmoid(ctx0, g);
+        g = ggml_sigmoid(ctx0, ggml_scale(ctx0, g, -1.0f));
         g = ggml_scale(ctx0, g, hparams.kda_gate_lower_bound);
     } else {
         g = ggml_mul(ctx0, ggml_softplus(ctx0, g), A);
