@@ -1297,6 +1297,32 @@ ggml_tensor * llm_build_context::llm_build_ffn(
                 cur = ggml_silu(ctx, cur);
                 cb(cur, "ffn_silu", il);
             } break;
+        case LLM_FFN_SITU:
+            {
+                // situ(gate, up) = [beta*tanh(gate/beta) * sigmoid(gate)]
+                //                * [linear_beta*tanh(up/linear_beta)]
+                // Both branches are consumed here, so the caller's parallel
+                // multiply must be suppressed - hence LLM_FFN_SEQ below, the
+                // same trick the STEP35 path uses.
+                // NOTE: `up` here is still the WEIGHT matrix parameter; the
+                // computed up-projection is `tmp`. Using `up` would silently
+                // build nonsense.
+                const float beta  = lctx.model.hparams.situ_beta;
+                const float lbeta = lctx.model.hparams.situ_linear_beta;
+                GGML_ASSERT(beta > 0.0f);
+                GGML_ASSERT(tmp != nullptr);
+
+                ggml_tensor * a = ggml_scale(ctx, ggml_tanh(ctx, ggml_scale(ctx, cur, 1.0f/beta)), beta);
+                a = ggml_mul(ctx, a, ggml_sigmoid(ctx, cur));
+
+                ggml_tensor * u = tmp;
+                if (lbeta > 0.0f) {
+                    u = ggml_scale(ctx, ggml_tanh(ctx, ggml_scale(ctx, tmp, 1.0f/lbeta)), lbeta);
+                }
+                cur = ggml_mul(ctx, a, u);
+                cb(cur, "ffn_situ", il);
+                type_gate = LLM_FFN_SEQ;
+            } break;
         case LLM_FFN_GELU:
             {
                 cur = ggml_gelu(ctx, cur);
@@ -2753,6 +2779,10 @@ ggml_cgraph * llm_build_context::llama_build_graph(
         case LLM_ARCH_QWEN3NEXT:
             {
                 result = llm.build_qwen3next();
+            } break;
+        case LLM_ARCH_KIMI_K3:
+            {
+                result = llm.build_kimi_k3();
             } break;
         case LLM_ARCH_QWEN35MOE:
             {
