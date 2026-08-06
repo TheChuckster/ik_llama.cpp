@@ -1378,7 +1378,7 @@ static common_chat_params common_chat_params_init_kimi_k3(const common_chat_temp
         // The whole reasoning block is optional: the message opener, the think
         // section, or both may be absent depending on how the turn was rendered.
         auto reasoning = extract_reasoning
-            ? p.optional(p.optional(MSG_OPEN) + THINK_OPEN + p.reasoning(p.until(THINK_CLOSE)) + THINK_CLOSE)
+            ? p.optional(p.optional(p.literal(MSG_OPEN)) + THINK_OPEN + p.reasoning(p.until(THINK_CLOSE)) + THINK_CLOSE)
             : p.eps();
         // Everything past the response close is message-level framing.
         return reasoning << RESP_OPEN << p.content(p.until(RESP_CLOSE)) << p.rest();
