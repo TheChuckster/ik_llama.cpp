@@ -1548,15 +1548,46 @@ void iqk_fused_delta_net_neon_impl(int n_heads, int gqa_ratio, int repeat_type, 
     }
 }
 #endif
-template <int head_dim>
+// per_channel selects Kimi-K3's full-rank KDA gate: head_dim decays per (head,
+// token) instead of one. Two things change with it, and they are not
+// independent:
+//
+//  1. LAYOUT. A per-head gate reaches us as an unmaterialised permute, so g and
+//     beta are read from the ORIGINAL buffer, head-fastest. A per-channel gate
+//     is ggml_cont'd by the graph builder into [n_tokens, head_dim, n_heads,
+//     n_seqs] - token-fastest, channels a whole n_tokens apart. The two
+//     indexings are transposes of each other; neither works for the other case.
+//
+//  2. MATH. A scalar decay factors out of the state-times-k and state-times-q
+//     sums, which is why the per-head path can fold it into the output
+//     coefficients and never touch the state until the update. A per-channel
+//     decay does not factor out - each column carries its own - so the state
+//     must be decayed BEFORE it is read. Done here inside the accumulation
+//     loop, so it still costs one pass over the state rather than two.
+//
+// Nothing else differs. The scalar reference in ggml.c additionally l2-norms q
+// and k, but build_qkv already does that in the graph for both Qwen3-Next and
+// K3, so on real input those factors are 1 and it is dead arithmetic; this
+// kernel leaves them to the graph, as the per-head path always has.
+//
+// Setting decay to exactly 1.0f on the per-channel path is what lets the output
+// coefficients below stay literally unchanged - multiplying by 1.0f is
+// bit-exact, and the real per-channel decays are already inside the sums. The
+// per-head instantiation therefore compiles to exactly the code it did before:
+// every branch is on a template parameter, and no expression is rewritten.
+template <int head_dim, bool per_channel>
 void iqk_fused_delta_net_impl(int n_heads, int gqa_ratio, int repeat_type, int n_tokens, int n_seqs,
         size_t vnb1, size_t vnb2, size_t vnb3,
         const float * q_data, const float * k_data, const float * v_data, const float * g_data, const float * beta_data,
         const float * state_in, float * out_data, float * state_out, float * saved_steps, int state_step_stride, int ith, int nth) {
 #ifdef __ARM_NEON
-    iqk_fused_delta_net_neon_impl<head_dim>(n_heads, gqa_ratio, repeat_type, n_tokens, n_seqs, vnb1, vnb2, vnb3,
-            q_data, k_data, v_data, g_data, beta_data, state_in, out_data, state_out, saved_steps, state_step_stride, ith, nth);
-    return;
+    // The NEON kernel has no per-channel path; fall through to the portable
+    // code below, which does.
+    if constexpr (!per_channel) {
+        iqk_fused_delta_net_neon_impl<head_dim>(n_heads, gqa_ratio, repeat_type, n_tokens, n_seqs, vnb1, vnb2, vnb3,
+                q_data, k_data, v_data, g_data, beta_data, state_in, out_data, state_out, saved_steps, state_step_stride, ith, nth);
+        return;
+    }
 #endif
     const int total_heads = n_heads * n_seqs;
     const int heads_per_thread = (total_heads + nth - 1) / nth;
@@ -1584,6 +1615,12 @@ void iqk_fused_delta_net_impl(int n_heads, int gqa_ratio, int repeat_type, int n
         const int qkv_head_offset_kq  = batch_idx * (head_dim * n_tokens * n_heads/gqa_ratio) + head_idx_kq * (head_dim * n_tokens);
         const int qkv_token_stride = head_dim;
         const int g_batch_offset   = batch_idx * n_tokens * n_heads;
+        // Token-fastest offsets, used only by the per-channel branch. These
+        // mirror g_head_offset / beta_head_offset in ggml.c exactly - beta stays
+        // one value per (head, token) even when the gate does not, so it needs
+        // its own offset rather than sharing the gate's.
+        const int g_head_offset    = (batch_idx * (n_tokens * n_heads) + head_idx * n_tokens) * head_dim;
+        const int beta_head_offset =  batch_idx * (n_tokens * n_heads) + head_idx * n_tokens;
         const int state_head_offset = batch_idx * (head_dim * head_dim * n_heads) + head_idx * (head_dim * head_dim);
         const int out_head_offset  = batch_idx * (head_dim * n_heads * n_tokens) + head_idx * head_dim;
         const int out_token_stride = head_dim * n_heads;
@@ -1598,8 +1635,10 @@ void iqk_fused_delta_net_impl(int n_heads, int gqa_ratio, int repeat_type, int n
             const float * k_t = k_data + qkv_head_offset_kq + t * qkv_token_stride;
             const float * v_t = v_data + batch_idx * vnb3 + head_idx * vnb2 + t * vnb1;
 
-            const float g_val    = g_data[g_batch_offset + t * n_heads + head_idx];
-            const float beta_raw = beta_data[g_batch_offset + t * n_heads + head_idx];
+            const float * g_t    = per_channel ? g_data + g_head_offset + t : nullptr;
+            const float g_val    = per_channel ? 0.0f : g_data[g_batch_offset + t * n_heads + head_idx];
+            const float beta_raw = per_channel ? beta_data[beta_head_offset + t]
+                                               : beta_data[g_batch_offset + t * n_heads + head_idx];
 
             float kq_sum    = 0.0f;
 #if defined __AVX512F__
@@ -1625,9 +1664,20 @@ void iqk_fused_delta_net_impl(int n_heads, int gqa_ratio, int repeat_type, int n
 #endif
 
             const float beta_val = 1.0f / (1.0f + expf(-beta_raw));
-            const float decay    = expf(fminf(g_val, 50.0f));
+            // Exactly 1.0f per-channel: the real decays go in per column, below.
+            const float decay    = per_channel ? 1.0f : expf(fminf(g_val, 50.0f));
 
             float attn_score = kq_sum * scale;
+
+            // One decay per channel, gathered across the token axis. Strided by
+            // n_tokens, so this is head_dim scattered loads against the
+            // 3*head_dim^2 FMAs that follow.
+            float decay_vec[per_channel ? head_dim : 1];
+            if constexpr (per_channel) {
+                for (int col = 0; col < head_dim; ++col) {
+                    decay_vec[col] = expf(fminf(g_t[col * n_tokens], 50.0f));
+                }
+            }
 
             float * out_t = out_data + out_head_offset + t * out_token_stride;
 
@@ -1640,10 +1690,19 @@ void iqk_fused_delta_net_impl(int n_heads, int gqa_ratio, int repeat_type, int n
                 auto q_col = _mm512_set1_ps(q_t[col]);
                 for (int j = 0; j < head_dim/16; ++j) {
                     auto s = _mm512_loadu_ps(state + col * head_dim + 16*j);
+                    // Decay here rather than writing the decayed state back:
+                    // the update loop below re-applies it per column, so the
+                    // state is read and written exactly as often as the
+                    // per-head path reads and writes it. The set1 is
+                    // loop-invariant and gets hoisted.
+                    if constexpr (per_channel) s = _mm512_mul_ps(s, _mm512_set1_ps(decay_vec[col]));
                     v_prime[j] = _mm512_fmadd_ps(s, k_col, v_prime[j]);
                     out_val[j] = _mm512_fmadd_ps(s, q_col, out_val[j]);
                 }
             }
+            // Per-head: decay factors out of both sums, so it rides in c2/c3.
+            // Per-channel: it is already in the sums, and what rides here
+            // instead are the q/k normalisations the scalar reference applies.
             auto c1 = _mm512_set1_ps(beta_val);
             auto c2 = _mm512_set1_ps(beta_val*decay);
             auto c3 = _mm512_set1_ps(decay*scale);
@@ -1659,6 +1718,9 @@ void iqk_fused_delta_net_impl(int n_heads, int gqa_ratio, int repeat_type, int n
             auto vd   = _mm512_set1_ps(decay);
             for (int col = 0; col < head_dim; ++col) {
                 auto vk = _mm512_set1_ps(k_t[col]);
+                // Per-head hoists vd out of this loop as before; only the
+                // per-channel path reloads it per column. Inner body identical.
+                if constexpr (per_channel) vd = _mm512_set1_ps(decay_vec[col]);
                 for (int j = 0; j < head_dim/16; ++j) {
                     auto vs = _mm512_loadu_ps(state + col * head_dim + 16*j);
                     vs = _mm512_fmadd_ps(v_prime[j], vk, _mm512_mul_ps(vs, vd));
@@ -1670,8 +1732,12 @@ void iqk_fused_delta_net_impl(int n_heads, int gqa_ratio, int repeat_type, int n
             std::memset(v_prime, 0, head_dim*sizeof(float));
             std::memset(out_val, 0, head_dim*sizeof(float));
             for (int col = 0; col < head_dim; ++col) {
-                const float k_col = k_t[col];
-                const float q_col = q_t[col];
+                // Folding the column's decay into k/q is the same arithmetic as
+                // decaying the state, at head_dim multiplies instead of
+                // head_dim^2. Exactly 1.0f on the per-head path.
+                const float d_col = per_channel ? decay_vec[col] : 1.0f;
+                const float k_col = k_t[col] * d_col;
+                const float q_col = q_t[col] * d_col;
                 for (int row = 0; row < head_dim; ++row) {
                     const float s = state[row + col * head_dim];
                     v_prime[row] += s * k_col;
@@ -1690,6 +1756,7 @@ void iqk_fused_delta_net_impl(int n_heads, int gqa_ratio, int repeat_type, int n
             auto vmax = _mm256_set1_ps( 1e6f);
             for (int col = 0; col < head_dim; ++col) {
                 auto vk = _mm256_set1_ps(k_t[col]);
+                if constexpr (per_channel) vd = _mm256_set1_ps(decay_vec[col]);
                 for (int row = 0; row < head_dim; row += 8) {
                     auto vs = _mm256_loadu_ps(state + col * head_dim + row);
                     auto vn = _mm256_loadu_ps(v_new_buf + row);
@@ -1704,9 +1771,10 @@ void iqk_fused_delta_net_impl(int n_heads, int gqa_ratio, int repeat_type, int n
 #else
             for (int col = 0; col < head_dim; ++col) {
                 const float k_col = k_t[col];
+                const float d_col = per_channel ? decay_vec[col] : decay;
                 for (int row = 0; row < head_dim; ++row) {
                     float s = state[row + col * head_dim];
-                    s = decay * s + v_new_buf[row] * k_col;
+                    s = d_col * s + v_new_buf[row] * k_col;
                     state[row + col * head_dim] = fminf(fmaxf(s, -1e6f), 1e6f);
                 }
             }
@@ -1722,20 +1790,25 @@ void iqk_fused_delta_net_impl(int n_heads, int gqa_ratio, int repeat_type, int n
 }
 }
 
-bool iqk_fused_delta_net(int head_dim, int n_heads, int gqa_ratio, int repeat_type, int n_tokens, int n_seqs,
+bool iqk_fused_delta_net(int head_dim, int n_heads, int gqa_ratio, int repeat_type, bool gate_per_channel,
+        int n_tokens, int n_seqs,
         size_t vnb1, size_t vnb2, size_t vnb3,
         const float * q_data, const float * k_data, const float * v_data, const float * g_data, const float * beta_data,
         const float * state_in, float * out_data, float * state_out, float * saved_steps, int state_step_stride, int ith, int nth) {
     if (head_dim != 64 && head_dim != 128) {
         return false;
     }
+#define IQK_DELTA_NET_CALL(HD, PC) \
+    iqk_fused_delta_net_impl<HD, PC>(n_heads, gqa_ratio, repeat_type, n_tokens, n_seqs, vnb1, vnb2, vnb3, \
+            q_data, k_data, v_data, g_data, beta_data, state_in, out_data, state_out, saved_steps, state_step_stride, ith, nth)
     if (head_dim == 64) {
-        iqk_fused_delta_net_impl<64>(n_heads, gqa_ratio, repeat_type, n_tokens, n_seqs, vnb1, vnb2, vnb3, q_data, k_data, v_data, g_data, beta_data, state_in,
-                out_data, state_out, saved_steps, state_step_stride, ith, nth);
+        if (gate_per_channel) IQK_DELTA_NET_CALL(64, true);
+        else                  IQK_DELTA_NET_CALL(64, false);
     } else {
-        iqk_fused_delta_net_impl<128>(n_heads, gqa_ratio, repeat_type, n_tokens, n_seqs, vnb1, vnb2, vnb3, q_data, k_data, v_data, g_data, beta_data, state_in,
-                out_data, state_out, saved_steps, state_step_stride, ith, nth);
+        if (gate_per_channel) IQK_DELTA_NET_CALL(128, true);
+        else                  IQK_DELTA_NET_CALL(128, false);
     }
+#undef IQK_DELTA_NET_CALL
     return true;
 }
 
