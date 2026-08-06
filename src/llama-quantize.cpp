@@ -1225,6 +1225,8 @@ static void llama_model_quantize_internal(const std::string & fname_inp, const s
     int n_to_repack = 0, n_to_modify = 0;
     const std::vector<std::string> * repack_pattern = nullptr;
     if (params->repack_pattern) repack_pattern = (const std::vector<std::string> *)params->repack_pattern;
+    const std::vector<std::string> * keep_pattern = nullptr;
+    if (params->keep_pattern) keep_pattern = (const std::vector<std::string> *)params->keep_pattern;
 
     for (int i = 0; i < ml.n_tensors; ++i) {
         const struct ggml_tensor * meta = ml.get_tensor_meta(i);
@@ -1468,6 +1470,25 @@ static void llama_model_quantize_internal(const std::string & fname_inp, const s
 
         quantize &= params->quantize_output_tensor || name != "output.weight";
         quantize &= !params->only_copy;
+
+        // --keep-pattern: copy these tensors through byte for byte.
+        //
+        // There is no "same type" shortcut in this function - asking for a type
+        // a tensor already has still dequantizes and requantizes it, which for
+        // an IQ2_XS expert is hours of work and a lossy round trip to produce
+        // (nearly) what was already there. That makes "requantize only the
+        // non-expert tensors" impossible to express, which matters because on a
+        // model like Kimi K3 the experts are 93% of the file and 19% of what a
+        // token reads: the tensors worth requantizing are exactly the ones a
+        // whole-file pass spends all its time NOT changing.
+        if (keep_pattern) {
+            for (auto & r : *keep_pattern) {
+                if (std::regex_search(tensor->name, std::regex(r))) {
+                    quantize = false;
+                    break;
+                }
+            }
+        }
 
         // do not quantize expert gating tensors
         // NOTE: can't use LLM_TN here because the layer number is not known

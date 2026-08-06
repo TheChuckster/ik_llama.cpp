@@ -550,6 +550,7 @@ extern "C" {
         void * kv_overrides;                 // pointer to vector containing overrides
         void * custom_quants;                // pointer to vector containing custom quantization rules
         void * repack_pattern;               // pointer to a vector containing regexes to be used for matching tensor names. Can be null
+        void * keep_pattern;                 // regexes for tensors to COPY VERBATIM, never (re)quantize. Can be null
         struct quantize_user_data * user_data; // so we can pass extra data to the quantization functions
     } llama_model_quantize_params;
 
