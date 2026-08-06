@@ -153,7 +153,7 @@ static bool try_parse_ftype(const std::string & ftype_str_in, llama_ftype & ftyp
 //
 [[noreturn]]
 static void usage(const char * executable) {
-    printf("usage: %s [--help] [--allow-requantize] [--leave-output-tensor] [--pure] [--imatrix] [--hide-imatrix] [--ignore-imatrix-rules] [--dry-run] [--include-weights] [--exclude-weights] [--output-tensor-type] [--token-embedding-type] [--per-layer-token-embedding-type] [--extra-output-tensor] [--fudge-factors] [--ffn-gate-inp-type] [--attn-q-type] [--attn-k-type] [--attn-v-type] [--attn-qkv-type] [--attn-output-type] [--ffn-gate-type] [--ffn-down-type] [--ffn-up-type] [--repack] [--repack-pattern] [--keep-split] [--partial-requant] [--override-kv] model-f32.gguf [model-quant.gguf] type [nthreads]\n\n", executable);
+    printf("usage: %s [--help] [--allow-requantize] [--leave-output-tensor] [--pure] [--imatrix] [--hide-imatrix] [--ignore-imatrix-rules] [--dry-run] [--include-weights] [--exclude-weights] [--output-tensor-type] [--token-embedding-type] [--per-layer-token-embedding-type] [--extra-output-tensor] [--fudge-factors] [--ffn-gate-inp-type] [--attn-q-type] [--attn-k-type] [--attn-v-type] [--attn-qkv-type] [--attn-output-type] [--ffn-gate-type] [--ffn-down-type] [--ffn-up-type] [--repack] [--repack-pattern] [--keep-pattern] [--keep-split] [--partial-requant] [--override-kv] model-f32.gguf [model-quant.gguf] type [nthreads]\n\n", executable);
     printf("  --allow-requantize: Allows requantizing tensors that have already been quantized. Warning: This can severely reduce quality compared to quantizing from 16bit or 32bit\n");
     printf("  --leave-output-tensor: Will leave output.weight un(re)quantized. Increases model size but may also increase quality, especially when requantizing\n");
     printf("  --pure: Disable k-quant mixtures and quantize all tensors to the same type\n");
@@ -171,6 +171,9 @@ static void usage(const char * executable) {
     printf("  --custom-q regex1=type1,regex2=type2...: use this to specify custom quantization type rules.\n\n");
     printf("  --repack Repack all tensors to the corresponding _r4/8 variant if available.\n\n");
     printf("  --repack-pattern Comma separated list of regexs to use for matching tensor names to be repacked.\n\n");
+    printf("  --keep-pattern Comma separated list of regexs; matching tensors are COPIED VERBATIM, never (re)quantized.\n");
+    printf("      Asking for a type a tensor already has still dequantizes and requantizes it, so this is the only way\n");
+    printf("      to requantize part of a model - e.g. --keep-pattern '_exps\\.' to leave every routed expert untouched.\n\n");
     printf("  --symmetric-q40  Use [-7:7] range for Q4_0 quantization (turns off imatrix)\n\n");
     printf("  --slow-iq2ks Use the original very slow IQ2_KS quantization method.\n\n");
     printf("  --fudge-factors type1=ff1,type2=ff2... Apply scale fudge factors during quantization as specified by type=fudge-factor.\n\n");
@@ -385,6 +388,7 @@ int main(int argc, char ** argv) {
     params.user_data = &user_data;
 
     std::vector<std::string> repack_patterns;
+    std::vector<std::string> keep_patterns;
 
     std::unordered_map<ggml_type, float> fudge_factors;
 
@@ -407,6 +411,13 @@ int main(int argc, char ** argv) {
             if (arg_idx < argc-1) {
                 auto p = string_split(argv[++arg_idx], ',');
                 repack_patterns.insert(repack_patterns.end(), p.begin(), p.end());
+            } else {
+                usage(argv[0]);
+            }
+        } else if (strcmp(argv[arg_idx], "--keep-pattern") == 0) {
+            if (arg_idx < argc-1) {
+                auto p = string_split(argv[++arg_idx], ',');
+                keep_patterns.insert(keep_patterns.end(), p.begin(), p.end());
             } else {
                 usage(argv[0]);
             }
@@ -539,6 +550,9 @@ int main(int argc, char ** argv) {
         }
     }
 
+    if (!keep_patterns.empty()) {
+        params.keep_pattern = &keep_patterns;
+    }
     if (!repack_patterns.empty()) {
         params.repack_pattern = &repack_patterns;
     }
