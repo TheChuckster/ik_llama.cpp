@@ -226,11 +226,11 @@ ggml_tensor * llm_build_context::build_kimi_k3_latent_moe(ggml_cgraph * gf, ggml
     ggml_tensor * inp = llm_build_norm(ctx0, cur, hparams, layer.ffn_norm, nullptr, LLM_NORM_RMS, cb, il);
     cb(inp, "ffn_norm", il);
 
-    // routed path: 7168 -> 3584, norm, experts, 3584 -> 7168
+    // routed path: 7168 -> 3584 -> experts -> norm -> 7168.
+    // ffn_routed_norm normalises the EXPERT OUTPUT, not the expert input. It sits
+    // after build_moe_ffn and before ffn_routed_up.
     ggml_tensor * h = ggml_mul_mat(ctx0, layer.ffn_routed_down, inp);
     cb(h, "ffn_routed_down", il);
-    h = llm_build_norm(ctx0, h, hparams, layer.ffn_routed_norm, nullptr, LLM_NORM_RMS, cb, il);
-    cb(h, "ffn_routed_norm", il);
 
     // The router scores the FULL residual width, not the down-projected tensor -
     // ffn_gate_inp is [n_embd, n_expert]. So the logits are computed here from
@@ -253,6 +253,9 @@ ggml_tensor * llm_build_context::build_kimi_k3_latent_moe(ggml_cgraph * gf, ggml
             (llm_expert_gating_func_type) hparams.expert_gating_func,
             cb, il, gf, false, nullptr, nullptr, logits);
     cb(moe, "ffn_moe_out", il);
+
+    moe = llm_build_norm(ctx0, moe, hparams, layer.ffn_routed_norm, nullptr, LLM_NORM_RMS, cb, il);
+    cb(moe, "ffn_routed_norm", il);
 
     moe = ggml_mul_mat(ctx0, layer.ffn_routed_up, moe);
     cb(moe, "ffn_routed_up", il);
