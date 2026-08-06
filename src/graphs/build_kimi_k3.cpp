@@ -109,7 +109,10 @@ ggml_cgraph * llm_build_context::build_kimi_k3() {
     const float   eps         = hparams.f_norm_rms_eps;
 
     const uint32_t res_bs       = hparams.attn_res_block_size;
-    const bool     use_attn_res = res_bs > 0;
+    // KIMI_K3_NO_ATTNRES=1 falls back to a plain residual add. AttnRes is the
+    // part with no ik precedent, so being able to switch it off is the fastest
+    // way to tell whether a quality problem lives there or downstream of it.
+    const bool     use_attn_res = res_bs > 0 && !getenv("KIMI_K3_NO_ATTNRES");
 
     const int64_t n_latent = hparams.n_expert_latent > 0 ? hparams.n_expert_latent : n_embd_full;
 
