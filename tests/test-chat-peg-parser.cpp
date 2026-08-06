@@ -22,6 +22,7 @@ static void test_command7_parser_compare(testing & t);
 static void test_prefix_tool_names(testing & t);
 static void test_tagged_peg_parser(testing & t);
 static void test_kimi_k3_parser(testing & t);
+static void test_kimi_k3_tool_parser(testing & t);
 
 int main(int argc, char * argv[]) {
     testing t(std::cout);
@@ -41,6 +42,7 @@ int main(int argc, char * argv[]) {
     t.test("prefix tool names", test_prefix_tool_names);
     t.test("tagged peg parser", test_tagged_peg_parser);
     t.test("kimi k3", test_kimi_k3_parser);
+    t.test("kimi k3 tools", test_kimi_k3_tool_parser);
 
     return t.summary();
 }
@@ -1031,4 +1033,66 @@ static void test_kimi_k3_parser(testing & t) {
     t.assert_equal("k3 reasoning",
                    std::string("The user asks for the capital of Japan in one word. The answer is Tokyo."),
                    msg.reasoning_content);
+}
+
+// K3 emits tool calls as nested open/sep/close tags with the value as tag body,
+// not as JSON. Both `call` and `argument` carry a trailing attribute after the
+// one being matched on (index=, type=), so each opener has to skip to <|sep|>
+// rather than match a fixed suffix.
+static void test_kimi_k3_tool_parser(testing & t) {
+    const std::string RESP_OPEN  = "<|open|>response<|sep|>";
+    const std::string RESP_CLOSE = "<|close|>";
+    const std::string SEP        = "<|sep|>";
+    const std::string CALL_OPEN  = "<|open|>call tool=\"";
+    const std::string CALL_CLOSE = "<|close|>call<|sep|>";
+    const std::string ARG_OPEN   = "<|open|>argument key=\"";
+    const std::string ARG_CLOSE  = "<|close|>argument<|sep|>";
+
+    auto parser = build_chat_peg_parser([&](common_chat_peg_builder & p) -> common_peg_parser {
+        auto arg = [&](const std::string & name, bool is_string) {
+            auto body  = p.until(ARG_CLOSE);
+            auto value = is_string ? p.tool_arg_string_value(body) : p.tool_arg_value(body);
+            return p.tool_arg(p.tool_arg_open(p.literal(ARG_OPEN) + p.tool_arg_name(p.literal(name)) +
+                                              p.literal("\"") + p.until(SEP) + p.literal(SEP)) +
+                              value + p.tool_arg_close(p.literal(ARG_CLOSE)));
+        };
+        auto args = p.zero_or_more(p.choice({ arg("city", true), arg("days", false) }) + p.space());
+        auto call = p.tool(p.tool_open(p.literal(CALL_OPEN) + p.tool_name(p.literal("get_weather")) +
+                                       p.literal("\"") + p.until(SEP) + p.literal(SEP)) +
+                           p.space() + p.tool_args(args) + p.space() + p.tool_close(p.literal(CALL_CLOSE)));
+        auto tools = p.trigger_rule("tool-calls",
+            p.literal("<|open|>tools<|sep|>") + p.space() + p.repeat(call + p.space(), 1, -1) +
+            p.optional(p.literal("<|close|>tools<|sep|>")));
+        return RESP_OPEN + p.content(p.until(RESP_CLOSE)) +
+               p.optional(p.literal("<|close|>response<|sep|>")) + p.optional(tools) + p.rest();
+    });
+
+    const std::string input =
+        "<|open|>response<|sep|><|close|>response<|sep|>"
+        "<|open|>tools<|sep|>"
+        "<|open|>call tool=\"get_weather\" index=\"1\"<|sep|>"
+        "<|open|>argument key=\"city\" type=\"string\"<|sep|>Oslo<|close|>argument<|sep|>"
+        "<|open|>argument key=\"days\" type=\"number\"<|sep|>3<|close|>argument<|sep|>"
+        "<|close|>call<|sep|>"
+        "<|close|>tools<|sep|><|close|>message<|sep|>";
+
+    common_peg_parse_context ctx(input, COMMON_PEG_PARSE_FLAG_NONE);
+    auto result = parser.parse(ctx);
+    if (!t.assert_equal("k3 tool parse ok", false, result.fail())) {
+        t.log(input.substr(0, result.end) + "[failed->]" + input.substr(result.end));
+        return;
+    }
+
+    common_chat_msg msg;
+    auto            mapper = common_chat_peg_mapper(msg);
+    mapper.from_ast(ctx.ast, result);
+
+    if (!t.assert_equal("k3 tool count", size_t(1), msg.tool_calls.size())) {
+        return;
+    }
+    t.log("Tool name: " + msg.tool_calls[0].name);
+    t.log("Tool args: " + msg.tool_calls[0].arguments);
+    t.assert_equal("k3 tool name", std::string("get_weather"), msg.tool_calls[0].name);
+    // A string body must come back quoted, a number body bare.
+    t.assert_equal("k3 tool args", std::string("{\"city\":\"Oslo\",\"days\":3}"), msg.tool_calls[0].arguments);
 }
