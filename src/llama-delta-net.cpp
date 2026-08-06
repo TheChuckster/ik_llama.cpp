@@ -95,9 +95,17 @@ std::pair<ggml_tensor *, ggml_tensor *> delta_net::build_fused_delta_net(ggml_co
     GGML_ASSERT(q->ne[0] == S_k && q->ne[2] == H_k && q->ne[1] == n_tokens && q->ne[3] == n_seqs);
     GGML_ASSERT(k->ne[0] == S_k && k->ne[2] == H_k && k->ne[1] == n_tokens && k->ne[3] == n_seqs);
     GGML_ASSERT(v->ne[2] == n_tokens);
-    const bool scalar_gate = g->ne[0] == H_v && g->ne[1] == n_tokens && g->ne[2] == n_seqs;
-    const bool channel_gate = g->ne[0] == S_v && g->ne[1] == H_v && g->ne[2] == n_tokens && g->ne[3] == n_seqs;
-    GGML_ASSERT(scalar_gate || channel_gate);
+    // The forget gate arrives in one of two shapes:
+    //   per-head    [H_v, n_tokens, n_seqs]        - Qwen3-Next
+    //   per-channel [S_v, H_v, n_tokens, n_seqs]   - Kimi-K3's full-rank KDA gate
+    // NOT ggml_n_dims(): it reports 3 for [S_v, H_v, n_tokens, 1] because a
+    // trailing 1 counts as absent, and n_seqs is 1 in the common case.
+    const bool g_per_channel = g->ne[0] == S_v && g->ne[1] == H_v && g->ne[2] == n_tokens;
+    if (g_per_channel) {
+        GGML_ASSERT(g->ne[2] == n_tokens && g->ne[3] == n_seqs);
+    } else {
+        GGML_ASSERT(g->ne[0] == H_v && g->ne[1] == n_tokens && g->ne[2] == n_seqs);
+    }
     GGML_ASSERT(beta->ne[0] == H_v && beta->ne[2] == n_tokens && beta->ne[3] == n_seqs);
     GGML_ASSERT(state->ne[0] == S_v && state->ne[1] == S_v && state->ne[2] == H_v && state->ne[3] == n_seqs);
     //GGML_ASSERT(H_k == H_v);
@@ -111,7 +119,15 @@ std::pair<ggml_tensor *, ggml_tensor *> delta_net::build_fused_delta_net(ggml_co
     cb(state,"state_in", il);
 
     v = ggml_permute(ctx0, v, 0, 2, 1, 3);
-    g = channel_gate ? ggml_permute(ctx0, g, 1, 2, 0, 3) : ggml_permute(ctx0, g, 2, 0, 3, 1);
+    // ggml_delta_net wants the TOKEN axis first: [n_tokens, 1|S_v, H_v, n_seqs].
+    // The per-channel case needs a different permutation than the per-head one,
+    // and it must be made contiguous - the CPU kernel indexes the gate buffer
+    // directly rather than walking nb strides.
+    if (g_per_channel) {
+        g = ggml_cont(ctx0, ggml_permute(ctx0, g, 1, 2, 0, 3));
+    } else {
+        g = ggml_permute(ctx0, g, 2, 0, 3, 1);
+    }
     beta = ggml_permute(ctx0, beta, 2, 0, 1, 3);
 
     ggml_tensor * state_flat = ggml_reshape_4d(ctx0, state, S_v, S_v * H_v, 1, n_seqs);
@@ -665,4 +681,3 @@ ggml_tensor * delta_net::build_layer_attn_linear(ggml_context * ctx0, ggml_cgrap
     return out;
 
 }
-

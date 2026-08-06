@@ -1663,6 +1663,18 @@ llm_expert_gating_func_type   gating_op,
             constexpr float alpha = 1.702f;
             constexpr float limit = 7.0f;
             par = ggml_swiglu_oai(ctx, gate, up, alpha, limit);
+        } else if (type_op == LLM_FFN_SITU) {
+            // Kimi-K3. Same expression as the dense path in llm_build_ffn; the
+            // experts use it too, so it has to exist on both switches.
+            const float beta  = lctx.model.hparams.situ_beta;
+            const float lbeta = lctx.model.hparams.situ_linear_beta;
+            GGML_ASSERT(beta > 0.0f);
+            ggml_tensor * a = ggml_scale(ctx, ggml_tanh(ctx, ggml_scale(ctx, gate, 1.0f/beta)), beta);
+            a = ggml_mul(ctx, a, ggml_sigmoid(ctx, gate));
+            ggml_tensor * u = lbeta > 0.0f
+                ? ggml_scale(ctx, ggml_tanh(ctx, ggml_scale(ctx, up, 1.0f/lbeta)), lbeta)
+                : up;
+            par = ggml_mul(ctx, a, u);
         }
         else {
             GGML_ABORT("fatal error");

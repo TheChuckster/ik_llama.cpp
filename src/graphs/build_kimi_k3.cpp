@@ -215,8 +215,16 @@ ggml_tensor * llm_build_context::build_kimi_k3_latent_moe(ggml_cgraph * gf, ggml
     h = llm_build_norm(ctx0, h, hparams, layer.ffn_routed_norm, nullptr, LLM_NORM_RMS, cb, il);
     cb(h, "ffn_routed_norm", il);
 
+    // The router scores the FULL residual width, not the down-projected tensor -
+    // ffn_gate_inp is [n_embd, n_expert]. So the logits are computed here from
+    // `inp` and handed in, with `h` supplying only the expert input. Passing `h`
+    // as both is a shape error at 7168 vs 3584, which is the loud version of this
+    // mistake; a model where the two happened to match would just route badly.
+    ggml_tensor * logits = ggml_mul_mat(ctx0, layer.ffn_gate_inp, inp);
+    cb(logits, "ffn_moe_logits", il);
+
     ggml_tensor * moe = llm_build_moe_ffn(ctx0, lctx, h,
-            layer.ffn_gate_inp,
+            nullptr,
             layer.ffn_up_exps,
             layer.ffn_gate_exps,
             layer.ffn_down_exps,
@@ -226,7 +234,7 @@ ggml_tensor * llm_build_context::build_kimi_k3_latent_moe(ggml_cgraph * gf, ggml
             hparams.expert_weights_norm,
             true, hparams.expert_weights_scale,
             (llm_expert_gating_func_type) hparams.expert_gating_func,
-            cb, il, gf);
+            cb, il, gf, false, nullptr, nullptr, logits);
     cb(moe, "ffn_moe_out", il);
 
     moe = ggml_mul_mat(ctx0, layer.ffn_routed_up, moe);
@@ -272,8 +280,96 @@ ggml_tensor * llm_build_context::build_kimi_k3_latent_moe(ggml_cgraph * gf, ggml
 //
 ggml_tensor * llm_build_context::build_kimi_k3_kda(ggml_cgraph * gf, ggml_tensor * cur,
         ggml_tensor * inp_out_ids, int il) {
-    GGML_UNUSED(gf); GGML_UNUSED(cur); GGML_UNUSED(inp_out_ids); GGML_UNUSED(il);
-    GGML_ABORT("kimi-k3: KDA layer not implemented yet (see porting/k3/GRAPH-BUILDER-SPEC.md)");
+
+    const auto & layer = model.layers[il];
+
+    const int64_t head_dim   = hparams.kda_head_dim;              // 128
+    const int64_t n_head_kda = hparams.n_head();                  // 96
+    const int64_t d_inner    = head_dim * n_head_kda;             // 12288
+    const int64_t n_seqs       = 1;
+    const int64_t n_seq_tokens = n_tokens;
+    const float   eps          = hparams.f_norm_rms_eps;
+
+    ggml_tensor * input = cur;
+
+    // ---- q/k/v, presented as the fused layout build_qkv expects ----
+    // Qwen3-Next projects q/k/v/z with one fused matrix; K3 keeps them separate.
+    // Concatenating here costs one copy and lets the whole conv + state +
+    // recurrence path below be reused rather than reimplemented.
+    ggml_tensor * q = ggml_mul_mat(ctx0, layer.wq, cur);
+    ggml_tensor * k = ggml_mul_mat(ctx0, layer.wk, cur);
+    ggml_tensor * v = ggml_mul_mat(ctx0, layer.wv, cur);
+    ggml_tensor * qkv_mixed = ggml_concat(ctx0, ggml_concat(ctx0, q, k, 0), v, 0);
+    qkv_mixed = ggml_reshape_3d(ctx0, qkv_mixed, 3*d_inner, n_seq_tokens, n_seqs);
+    cb(qkv_mixed, "kda_qkv", il);
+
+    // Same story for the three short convolutions: one fused [d_conv, 1, 3*d_inner]
+    // weight, matching the single conv-state buffer build_qkv reads and writes.
+    // ggml_ssm_conv wants the weight as a 2-D [d_conv, d_inner] matrix, while the
+    // GGUF ships each conv as [d_conv, 1, d_inner]. The middle axis is 1, so the
+    // reshape is a relabel rather than a copy.
+    ggml_tensor * conv_w = ggml_concat(ctx0,
+            ggml_concat(ctx0, layer.ssm_conv1d_q, layer.ssm_conv1d_k, 2),
+            layer.ssm_conv1d_v, 2);
+    conv_w = ggml_reshape_2d(ctx0, conv_w, hparams.ssm_d_conv, 3*d_inner);
+
+    // ---- forget gate ----
+    // gate_lower_bound is NOT a clamp; it selects the activation:
+    //   unset:            g = -exp(A_log) * softplus(f_b(f_a(x)) + dt_bias)
+    //   set (K3, -5.0):   g = lower_bound * sigmoid(exp(A_log) * (f_b(f_a(x)) + dt_bias))
+    // ssm_a stores -exp(A_log) folded at conversion time, so the scale(-1) below
+    // is what turns A back into +exp(A_log) inside the sigmoid.
+    ggml_tensor * g = ggml_mul_mat(ctx0, layer.ssm_f_b, ggml_mul_mat(ctx0, layer.ssm_f_a, cur));
+    g = ggml_add(ctx0, g, layer.ssm_dt_b);
+    g = ggml_reshape_3d(ctx0, g, head_dim, n_head_kda, n_tokens);
+
+    ggml_tensor * A = ggml_reshape_3d(ctx0, layer.ssm_a, 1, n_head_kda, 1);
+    g = ggml_mul(ctx0, g, A);                        // per-head scalar over 128 channels
+    if (hparams.kda_gate_lower_bound > -INFINITY) {
+        g = ggml_sigmoid(ctx0, ggml_scale(ctx0, g, -1.0f));
+        g = ggml_scale(ctx0, g, hparams.kda_gate_lower_bound);
+    } else {
+        g = ggml_mul(ctx0, ggml_softplus(ctx0, g), A);
+    }
+    cb(g, "kda_gate", il);
+
+    // Leave it channel-major as [S_v, H_v, n_tokens, n_seqs]; build_fused_delta_net
+    // recognises that shape as the per-channel gate and permutes it into the
+    // token-first layout the kernel wants.
+    g = ggml_reshape_4d(ctx0, g, head_dim, n_head_kda, n_seq_tokens, n_seqs);
+
+    // ---- beta: one per head, shaped [H_v, 1, n_tokens, n_seqs] ----
+    // Passed RAW. ik's delta-net kernel applies the sigmoid itself
+    // (beta_val = 1/(1+exp(-beta_raw))), so sigmoiding here would apply it twice
+    // - which stays in range and merely flattens the gate, i.e. fails quietly.
+    // Mainline sigmoids at this point because its kernel does not.
+    ggml_tensor * beta = ggml_mul_mat(ctx0, layer.ssm_beta, cur);     // [n_head, n_tokens]
+    beta = ggml_reshape_4d(ctx0, beta, n_head_kda, 1, n_seq_tokens, n_seqs);
+    cb(beta, "kda_beta", il);
+
+    // ---- conv + recurrence, reusing the delta-net plumbing ----
+    const uint32_t slots = llama_kv_qnext_state_slots(lctx.kv_self);
+    GGML_ASSERT(slots > 0);
+
+    ggml_tensor * out = delta_net::build_qkv(ctx0, lctx.kv_self.s_l[il], conv_w,
+            qkv_mixed, lctx.inp_s_seq_qnext, beta, g,
+            head_dim, n_head_kda, head_dim, n_head_kda, hparams.ssm_d_conv,
+            0, slots, false, eps, 1, il, cb, gf);
+    cb(out, "kda_out", il);
+
+    // ---- output gate, norm, projection ----
+    // Identical to Qwen3-Next's tail, so reuse it: per-head RMSNorm with
+    // ssm_norm, a SiLU gate from ssm_g, then the output projection.
+    ggml_tensor * z = ggml_mul_mat(ctx0, layer.ssm_g, cur);
+    out = delta_net::build_gated_output(lctx, ctx0, layer.ssm_norm, layer.wo,
+            out, z, head_dim, n_head_kda, n_tokens, il, cb);
+    cb(out, "kda_gated", il);
+
+    if (inp_out_ids) {
+        out = ggml_get_rows(ctx0, out, inp_out_ids);
+        GGML_UNUSED(input);
+    }
+    return out;
 }
 
 ggml_tensor * llm_build_context::build_kimi_k3_mla(ggml_cgraph * gf, ggml_tensor * cur,
