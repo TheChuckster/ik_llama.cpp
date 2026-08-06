@@ -120,15 +120,32 @@ std::pair<ggml_tensor *, ggml_tensor *> delta_net::build_fused_delta_net(ggml_co
 
     v = ggml_permute(ctx0, v, 0, 2, 1, 3);
     // ggml_delta_net wants the TOKEN axis first: [n_tokens, 1|S_v, H_v, n_seqs].
-    // The per-channel case needs a different permutation than the per-head one,
-    // and it must be made contiguous - the CPU kernel indexes the gate buffer
-    // directly rather than walking nb strides.
+    // The per-channel case needs a different permutation than the per-head one.
     if (g_per_channel) {
-        g = ggml_cont(ctx0, ggml_permute(ctx0, g, 1, 2, 0, 3));
+        g = ggml_permute(ctx0, g, 1, 2, 0, 3);
     } else {
         g = ggml_permute(ctx0, g, 2, 0, 3, 1);
     }
     beta = ggml_permute(ctx0, beta, 2, 0, 1, 3);
+
+    // These permutes leave v/g/beta as strided VIEWS, and only the fused kernel
+    // can read those - it is handed v's nb1/nb2/nb3 explicitly. The scalar
+    // reference path in ggml_compute_forward_delta_net_f32 casts v_data/g_data/
+    // beta_data to plain float* and indexes them with computed offsets, so it
+    // requires genuinely contiguous buffers.
+    //
+    // That distinction never mattered before: the fused path handles every
+    // per-head gate, so the scalar path was effectively dead code. A per-channel
+    // gate makes the fused kernel decline, and the scalar path then reads
+    // permuted memory as if it were contiguous - which runs at full speed and
+    // produces nonsense. Materialise them.
+    //
+    // (q and k are already contiguous: ggml_l2_norm produces fresh tensors.)
+    if (g_per_channel) {
+        v    = ggml_cont(ctx0, v);
+        g    = ggml_cont(ctx0, g);
+        beta = ggml_cont(ctx0, beta);
+    }
 
     ggml_tensor * state_flat = ggml_reshape_4d(ctx0, state, S_v, S_v * H_v, 1, n_seqs);
     if (!ggml_is_contiguous(state_flat)) {
