@@ -558,15 +558,33 @@ int main(int argc, char ** argv) {
 
     svr->set_exception_handler([](const httplib::Request &, httplib::Response & res, std::exception_ptr ep) {
         std::string message;
+        // Anything reaching here was thrown out of a handler. Reporting all of it as
+        // ERROR_TYPE_SERVER (500) conflates two very different situations, and the
+        // difference is load-bearing: 500 is retryable, so every OpenAI-compatible client
+        // backs off and resends. A malformed request is deterministic — the same body
+        // fails the same way every time — so those retries cannot succeed and nothing
+        // stops them.
+        //
+        // Only an explicitly-typed request fault is reclassified. Catching
+        // nlohmann::json::exception here would also cover json::parse(req.body), which is
+        // genuinely a 400 — but the same type is thrown by the ~41 .at()/get<T>() accesses
+        // in this file, including ones on server-internal state, and mislabelling an
+        // internal fault as the caller's mistake sends operators looking in the wrong
+        // place. That case wants a narrow body-parsing helper, not a type filter.
+        enum error_type type = ERROR_TYPE_SERVER;
         try {
             std::rethrow_exception(std::move(ep));
+        } catch (const common_chat_request_error & e) {
+            // Request validation rejected the body (e.g. unparseable tool call arguments).
+            message = e.what();
+            type    = ERROR_TYPE_INVALID_REQUEST;
         } catch (std::exception & e) {
             message = e.what();
         } catch (...) {
             message = "Unknown Exception";
         }
 
-        json formatted_error = format_error_response(message, ERROR_TYPE_SERVER);
+        json formatted_error = format_error_response(message, type);
         LOG_VERBOSE("Got exception", formatted_error);
         res_err(res, formatted_error);
     });

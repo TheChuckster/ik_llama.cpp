@@ -2720,8 +2720,10 @@ static void convert_tool_responses_gemma4(json & messages) {
 
 static void func_args_not_string(json & messages) {
     GGML_ASSERT(messages.is_array());
+    size_t message_index = 0;
     for (auto & message : messages) {
         if (message.contains("tool_calls")) {
+            size_t tool_call_index = 0;
             for (auto & tool_call : message["tool_calls"]) {
                 if (tool_call.contains("function") && tool_call["function"].contains("arguments")) {
                     auto & args = tool_call["function"]["arguments"];
@@ -2729,12 +2731,32 @@ static void func_args_not_string(json & messages) {
                         try {
                             args = json::parse(args.get<std::string>());
                         } catch (const std::exception & e) {
-                            throw std::runtime_error("Failed to parse tool call arguments as JSON: " + std::string(e.what()));
+                            // A client fault, so throw the type the server maps to 400 —
+                            // a 500 here is retried forever, because the offending value
+                            // lives in the caller's conversation history and is replayed
+                            // verbatim on every retry.
+                            //
+                            // Locate it, too. The nlohmann message gives a column offset
+                            // into a string the caller never sees as a standalone
+                            // document, so on its own it does not identify which of
+                            // hundreds of replayed tool calls is broken.
+                            std::string name;
+                            if (tool_call["function"].contains("name") && tool_call["function"]["name"].is_string()) {
+                                name = tool_call["function"]["name"].get<std::string>();
+                            }
+                            throw common_chat_request_error(
+                                "Failed to parse tool call arguments as JSON, at messages[" +
+                                std::to_string(message_index) + "].tool_calls[" +
+                                std::to_string(tool_call_index) + "]" +
+                                (name.empty() ? "" : " (function \"" + name + "\")") +
+                                ": " + std::string(e.what()));
                         }
                     }
                 }
+                tool_call_index++;
             }
         }
+        message_index++;
     }
 }
 
