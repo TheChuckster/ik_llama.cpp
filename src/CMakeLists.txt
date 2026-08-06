@@ -70,6 +70,7 @@ add_library(llama
             unicode-data.cpp
             unicode-script-data.cpp
             # graphs
+            graphs/build_kimi_k3.cpp
             graphs/build_llama.cpp
             graphs/build_muse_glimmer.cpp
             graphs/build_mistral3.cpp

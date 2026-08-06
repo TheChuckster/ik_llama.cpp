@@ -25,6 +25,10 @@ enum llm_ffn_op_type {
     LLM_FFN_RELU_SQR,
     LLM_FFN_SWIGLU,
     LLM_FFN_SWIGLU_OAI,
+    // Kimi-K3. A range-limited SwiGLU: as situ_beta -> inf it becomes SiLU, and
+    // the tanh soft-clip on both branches is the bound K3's MXFP8 QAT trained
+    // against - so implementing it as SwiGLU looks fine and is wrong.
+    LLM_FFN_SITU,
 };
 
 enum llm_ffn_gate_type {
@@ -248,6 +252,12 @@ struct llm_build_context {
 
     ggml_cgraph * build_qwen3next();
     ggml_cgraph * build_qwen4exp();
+    ggml_cgraph * build_kimi_k3();
+    ggml_tensor * build_kimi_k3_kda(ggml_cgraph * gf, ggml_tensor * cur, ggml_tensor * inp_out_ids, int il);
+    ggml_tensor * build_kimi_k3_mla(ggml_cgraph * gf, ggml_tensor * cur, ggml_tensor * KQ_mask,
+                                    ggml_tensor * inp_out_ids, float kq_scale, int il);
+    ggml_tensor * build_kimi_k3_latent_moe(ggml_cgraph * gf, ggml_tensor * cur,
+                                     const llama_layer & layer, int64_t n_latent, float eps, int il);
 
     ggml_cgraph * build_qwen35moe();
 
