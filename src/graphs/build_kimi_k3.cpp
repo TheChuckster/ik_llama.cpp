@@ -175,7 +175,11 @@ ggml_cgraph * llm_build_context::build_kimi_k3() {
                     layer.ffn_gate, nullptr, nullptr,
                     layer.ffn_down, nullptr, nullptr,
                     nullptr,
-                    LLM_FFN_SITU, LLM_FFN_PAR, cb, il, gf, true);
+                    // add_input=false: the residual is added by the caller via
+                    // prefix_sum. Qwen3-Next passes true here because it relies on
+                    // llm_build_ffn to do the residual; K3 does not, and passing
+                    // true adds the layer input twice.
+                    LLM_FFN_SITU, LLM_FFN_PAR, cb, il, gf, false);
             cb(cur, "ffn_out", il);
         } else {
             cur = build_kimi_k3_latent_moe(gf, cur, layer, n_latent, eps, il);
