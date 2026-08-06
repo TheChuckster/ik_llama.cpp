@@ -1478,6 +1478,17 @@ static void llama_model_quantize_internal(const std::string & fname_inp, const s
         quantize &= params->quantize_output_tensor || name != "output.weight";
         quantize &= !params->only_copy;
 
+        // --keep-f32: a tensor that arrives as F32 in an already-quantized model
+        // is F32 because the publisher chose that, and the choice is usually
+        // load-bearing - GLM-DSA's indexer.proj scores which tokens attention
+        // sees, K3's ssm_conv1d is asserted F32 by ggml_ssm_conv. They are also
+        // uniformly tiny, so quantizing them buys nothing and can break the
+        // model or quietly degrade it. Only meaningful when requantizing; on a
+        // real F32 source model this would quantize nothing, hence opt-in.
+        if (params->keep_f32 && tensor->type == GGML_TYPE_F32) {
+            quantize = false;
+        }
+
         // --keep-pattern: copy these tensors through byte for byte.
         //
         // There is no "same type" shortcut in this function - asking for a type
