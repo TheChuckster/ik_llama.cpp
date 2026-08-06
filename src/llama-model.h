@@ -355,6 +355,29 @@ struct llama_layer {
     struct ggml_tensor * ssm_alpha = nullptr;
     struct ggml_tensor * ssm_beta = nullptr;
 
+    // Kimi-K3 KDA: three separate short convolutions where Qwen3-Next fuses
+    // one, plus the low-rank gate projection f_a -> f_b whose H*K output is
+    // what makes the forget gate per-channel, and ssm_g, the output gate.
+    struct ggml_tensor * ssm_conv1d_q = nullptr;
+    struct ggml_tensor * ssm_conv1d_k = nullptr;
+    struct ggml_tensor * ssm_conv1d_v = nullptr;
+    struct ggml_tensor * ssm_f_a = nullptr;
+    struct ggml_tensor * ssm_f_b = nullptr;
+    struct ggml_tensor * ssm_g = nullptr;
+
+    // Kimi-K3 AttnRes: one folded [n_embd] vector per site, two sites per layer.
+    struct ggml_tensor * attn_res_score = nullptr;
+    struct ggml_tensor * ffn_res_score  = nullptr;
+
+    // Kimi-K3 latent MoE: the routed experts live at a narrower width, so the
+    // block projects down into it and back out.
+    struct ggml_tensor * ffn_routed_down = nullptr;
+    struct ggml_tensor * ffn_routed_norm = nullptr;
+    struct ggml_tensor * ffn_routed_up   = nullptr;
+
+    // Kimi-K3 gated MLA: computed from the layer input, applied to the attn output.
+    struct ggml_tensor * attn_gate = nullptr;
+
     // mamba
     struct ggml_tensor * ssm_conv1d = nullptr;
     struct ggml_tensor * ssm_a = nullptr;
@@ -476,6 +499,7 @@ struct llama_model {
     std::vector<struct ggml_tensor *> dflash_aux_hidden_norms;
 
     struct ggml_tensor * output_norm;
+    struct ggml_tensor * output_res_score = nullptr;  // Kimi-K3 AttnRes at the output site
     struct ggml_tensor * output_norm_b;
     struct ggml_tensor * output;
     struct ggml_tensor * output_b;
