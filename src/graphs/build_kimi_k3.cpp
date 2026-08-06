@@ -146,11 +146,16 @@ ggml_cgraph * llm_build_context::build_kimi_k3() {
         cur = llm_build_norm(ctx0, cur, hparams, layer.attn_norm, nullptr, LLM_NORM_RMS, cb, il);
         cb(cur, "attn_norm", il);
 
+        // inp_out_ids is deliberately NOT pushed into the attention layers.
+        // Narrowing to the output tokens inside the last layer leaves `cur` with
+        // 1 row while prefix_sum still has n_tokens, and ggml_add BROADCASTS
+        // rather than failing (n_tokens % 1 == 0), quietly corrupting the final
+        // residual on every prompt pass. AttnRes also banks full-width
+        // checkpoints, so the narrowing has to happen after the last mix.
         if (hparams.is_recurrent(il)) {
-            cur = build_kimi_k3_kda(gf, cur, il == n_layer - 1 ? inp_out_ids : nullptr, il);
+            cur = build_kimi_k3_kda(gf, cur, nullptr, il);
         } else {
-            cur = build_kimi_k3_mla(gf, cur, KQ_mask, il == n_layer - 1 ? inp_out_ids : nullptr,
-                                    kq_scale_mla, il);
+            cur = build_kimi_k3_mla(gf, cur, KQ_mask, nullptr, kq_scale_mla, il);
         }
 
         // THE subtle line. On a banking layer the running residual RESTARTS from
@@ -188,6 +193,11 @@ ggml_cgraph * llm_build_context::build_kimi_k3() {
     // One more mix at the output site before the final norm.
     if (use_attn_res) {
         cur = res.mix(ctx0, cur, model.output_res_score, n_embd_full, n_tokens, eps, cb, -1);
+    }
+
+    // Narrow to the requested output rows here, once, after the last mix.
+    if (inp_out_ids) {
+        cur = ggml_get_rows(ctx0, cur, inp_out_ids);
     }
 
     cur = build_output(lctx, ctx0, cur, model.output, model.output_norm, cb);
