@@ -24068,14 +24068,12 @@ static void ggml_compute_forward_delta_net_f32(
     }
 
     // A per-channel forget gate (Kimi-K3 KDA) carries head_dim decays per token
-    // instead of one. The fused kernel's signature has no way to express that -
-    // it reads g as a flat [n_tokens] run per head - so it must not be handed a
-    // full-rank gate. Fall through to the scalar reference path below, which
-    // handles both. Optimising that path is a separate exercise.
+    // instead of one. The fused kernel handles both; the scalar path below is
+    // the reference it is checked against, and the fallback where the fused
+    // kernel declines (head_dim not 64 or 128).
     const bool gate_per_channel = src3->ne[1] > 1;
 
-    if (!gate_per_channel &&
-        iqk_fused_delta_net(head_dim, n_heads, gqa_ratio, repeat_type, n_tokens, n_seqs,
+    if (iqk_fused_delta_net(head_dim, n_heads, gqa_ratio, repeat_type, gate_per_channel, n_tokens, n_seqs,
                 src2->nb[1]/sizeof(float), src2->nb[2]/sizeof(float), src2->nb[3]/sizeof(float),
                 q_data, k_data, v_data, g_data, beta_data, state_in,
                 out_data, state_working, saved_steps, (int) state_step_stride, ith, nth)) {
