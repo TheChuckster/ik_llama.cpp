@@ -1337,6 +1337,58 @@ static common_chat_params common_chat_params_init_functionary_v3_2(const common_
 
 // Kimi K2 Thinking - uses unique tool call ID format: functions.<name>:<index>
 // The ID contains both the function name and an incrementing counter
+// Kimi-K3. Nestable section format:
+//
+//   <|open|>NAME<|sep|>  BODY  <|close|>NAME<|sep|>
+//
+// The model emits its own message opener, so a full turn looks like:
+//
+//   <|open|>message role="assistant"<|sep|><|open|>think<|sep|> R <|close|>think<|sep|>
+//   <|open|>response<|sep|> ANSWER <|close|>response<|sep|><|close|>message<|sep|>
+//
+// Without a parser ik falls through to a generic one and every marker lands in
+// `content`, which an agent harness chokes on even though the answer is correct.
+//
+// Covered by test_kimi_k3_parser in tests/test-chat-peg-parser.cpp, whose fixture
+// comes from a server CRASH message rather than the post-processed `content`
+// field - an earlier attempt used the latter, which has the message opener
+// already stripped, so it tested against a string the parser never sees, passed,
+// and still crash-looped the server.
+static common_chat_params common_chat_params_init_kimi_k3(const common_chat_template &    tmpl,
+                                                          const autoparser::generation_params & inputs) {
+    common_chat_params data;
+
+    data.prompt            = common_chat_template_direct_apply_impl(tmpl, inputs);
+    data.format            = COMMON_CHAT_FORMAT_PEG_NATIVE;
+    data.supports_thinking = true;
+
+    const std::string MSG_OPEN    = "<|open|>message role=\"assistant\"<|sep|>";
+    const std::string THINK_OPEN  = "<|open|>think<|sep|>";
+    const std::string THINK_CLOSE = "<|close|>think<|sep|>";
+    const std::string RESP_OPEN   = "<|open|>response<|sep|>";
+    const std::string RESP_CLOSE  = "<|close|>";
+
+    data.thinking_start_tag = THINK_OPEN;
+    data.thinking_end_tag   = THINK_CLOSE;
+    data.preserved_tokens   = { "<|open|>", "<|sep|>", "<|close|>", "<|end_of_msg|>" };
+
+    auto extract_reasoning = inputs.reasoning_format != COMMON_REASONING_FORMAT_NONE && inputs.enable_thinking;
+
+    auto parser = build_chat_peg_parser([&](common_chat_peg_builder & p) -> common_peg_parser {
+        // The whole reasoning block is optional: the message opener, the think
+        // section, or both may be absent depending on how the turn was rendered.
+        auto reasoning = extract_reasoning
+            ? p.optional(p.optional(MSG_OPEN) + THINK_OPEN + p.reasoning(p.until(THINK_CLOSE)) + THINK_CLOSE)
+            : p.eps();
+        // Everything past the response close is message-level framing.
+        return reasoning << RESP_OPEN << p.content(p.until(RESP_CLOSE)) << p.rest();
+    });
+
+    data.parser = parser.save();
+
+    return data;
+}
+
 static common_chat_params common_chat_params_init_kimi_k2(const common_chat_template &    tmpl,
                                                           const autoparser::generation_params & inputs) {
     common_chat_params data;
@@ -2594,6 +2646,15 @@ std::optional<common_chat_params> common_chat_try_specialized_template(
     if (src.find(">>>all") != std::string::npos && src.find(">>>${recipient}") != std::string::npos) {
         LOG_DBG("Using specialized template: Functionary v3.2\n");
         return common_chat_params_init_functionary_v3_2(tmpl, params);
+    }
+
+    // Kimi-K3 - nestable <|open|>NAME<|sep|> ... <|close|>NAME<|sep|> sections.
+    // All three markers together: <|sep|> alone is not distinctive.
+    if (src.find("<|open|>")  != std::string::npos &&
+        src.find("<|sep|>")   != std::string::npos &&
+        src.find("<|close|>") != std::string::npos) {
+        LOG_DBG("Using specialized template: Kimi-K3\n");
+        return common_chat_params_init_kimi_k3(tmpl, params);
     }
 
     // Kimi K2 Thinking - uses unique tool call ID format: functions.<name>:<index>
