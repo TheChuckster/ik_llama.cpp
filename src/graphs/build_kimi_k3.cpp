@@ -374,7 +374,97 @@ ggml_tensor * llm_build_context::build_kimi_k3_kda(ggml_cgraph * gf, ggml_tensor
 
 ggml_tensor * llm_build_context::build_kimi_k3_mla(ggml_cgraph * gf, ggml_tensor * cur,
         ggml_tensor * KQ_mask, ggml_tensor * inp_out_ids, float kq_scale, int il) {
-    GGML_UNUSED(gf); GGML_UNUSED(cur); GGML_UNUSED(KQ_mask);
-    GGML_UNUSED(inp_out_ids); GGML_UNUSED(kq_scale); GGML_UNUSED(il);
-    GGML_ABORT("kimi-k3: MLA layer not implemented yet (see porting/k3/GRAPH-BUILDER-SPEC.md)");
+
+    const auto & layer = model.layers[il];
+    auto & kv_self = lctx.kv_self;
+
+    // The output gate reads the NORMED layer input, which is `cur` as handed in.
+    ggml_tensor * inp_gate = cur;
+
+    const int64_t n_embd_head_qk_rope = hparams.n_rot;                              // 64
+    const int64_t kv_lora_rank        = hparams.n_lora_kv;                          // 512
+    const int64_t n_embd_head_k_mla   = hparams.n_embd_head_k_mla ? hparams.n_embd_head_k_mla : n_embd_head_k;
+    const int64_t n_embd_head_v_mla   = hparams.n_embd_head_v_mla ? hparams.n_embd_head_v_mla : n_embd_head_v;
+    const int64_t n_embd_head_qk_nope = n_embd_head_k_mla - n_embd_head_qk_rope;    // 128
+
+    GGML_ASSERT(layer.wq_a && layer.wq_b && layer.wk_b && layer.wv_b);
+
+    // ---- Q: q_a -> norm -> q_b, then split nope/rope ----
+    ggml_tensor * Qcur = ggml_mul_mat(ctx0, layer.wq_a, cur);
+    Qcur = llm_build_norm(ctx0, Qcur, hparams, layer.attn_q_a_norm, nullptr, LLM_NORM_RMS, cb, il);
+    Qcur = ggml_mul_mat(ctx0, layer.wq_b, Qcur);
+    cb(Qcur, "q_b", il);
+
+    ggml_tensor * q_nope = ggml_view_3d(ctx0, Qcur, n_embd_head_qk_nope, n_head, n_tokens,
+            ggml_row_size(Qcur->type, n_embd_head_k_mla),
+            ggml_row_size(Qcur->type, n_embd_head_k_mla) * n_head, 0);
+    ggml_tensor * q_rope = ggml_view_3d(ctx0, Qcur, n_embd_head_qk_rope, n_head, n_tokens,
+            ggml_row_size(Qcur->type, n_embd_head_k_mla),
+            ggml_row_size(Qcur->type, n_embd_head_k_mla) * n_head,
+            ggml_row_size(Qcur->type, n_embd_head_qk_nope));
+
+    // ---- compressed KV ----
+    ggml_tensor * kv_pe = ggml_mul_mat(ctx0, layer.wkv_a_mqa, cur);
+    ggml_tensor * kv_compressed = ggml_view_2d(ctx0, kv_pe, kv_lora_rank, n_tokens,
+            ggml_row_size(kv_pe->type, kv_lora_rank + n_embd_head_qk_rope), 0);
+    ggml_tensor * k_rope = ggml_view_3d(ctx0, kv_pe, n_embd_head_qk_rope, 1, n_tokens,
+            ggml_row_size(kv_pe->type, kv_lora_rank + n_embd_head_qk_rope),
+            ggml_row_size(kv_pe->type, kv_lora_rank + n_embd_head_qk_rope),
+            ggml_row_size(kv_pe->type, kv_lora_rank));
+
+    // NO RoPE. K3 is nope-only: the 128/64 split is structural, and the rope
+    // half is carried through unrotated. The GGUF's rope keys are a red herring.
+    kv_compressed = llm_build_norm(ctx0, kv_compressed, hparams, layer.attn_kv_a_norm, nullptr, LLM_NORM_RMS, cb, il);
+    cb(kv_compressed, "kv_compressed", il);
+
+    // ---- write the compressed kv into the cache, rope half FIRST ----
+    // Order matters and matches build_deepseek2: [rope | lora] per row.
+    ggml_tensor * kvr = ggml_concat(ctx0, ggml_permute(ctx0, k_rope, 0, 2, 1, 3), kv_compressed, 0);
+    const size_t row_size = ggml_row_size(kv_self.k_l[il]->type, kv_lora_rank + n_embd_head_qk_rope);
+    ggml_tensor * kv_cache_view = ggml_view_2d(ctx0, kv_self.k_l[il], kv_self.k_l[il]->ne[0], n_tokens,
+            row_size, row_size * kv_head);
+    ggml_build_forward_expand(gf, ggml_cpy(ctx0, kvr, kv_cache_view));
+
+    ggml_tensor * kv_cache = ggml_view_2d(ctx0, kv_self.k_l[il],
+            kv_lora_rank + n_embd_head_qk_rope, n_kv, row_size, 0);
+    ggml_tensor * kv_cache_lora = ggml_view_2d(ctx0, kv_self.k_l[il], kv_lora_rank, n_kv, row_size,
+            ggml_row_size(kv_self.k_l[il]->type, n_embd_head_qk_rope));
+
+    // ---- absorb q_nope through wk_b ----
+    // Forced, not chosen: wk_b is [qk_nope, kv_lora, n_head] and mul_mat needs
+    // matching ne[0], so it can only multiply the 128-wide q_nope.
+    ggml_tensor * q_nope_perm = ggml_permute(ctx0, q_nope, 0, 2, 1, 3);
+    ggml_tensor * q_nope2 = ggml_mul_mat(ctx0, layer.wk_b, q_nope_perm);
+    cb(q_nope2, "q_nope_absorbed", il);
+
+    ggml_tensor * q = ggml_concat(ctx0, ggml_permute(ctx0, q_rope, 0, 2, 1, 3), q_nope2, 0);
+    cb(q, "q_mla", il);
+
+    ggml_tensor * kqv_compressed = ggml_flash_attn_ext(ctx0, q, kv_cache, kv_cache_lora, KQ_mask,
+            kq_scale, hparams.f_max_alibi_bias, 0.f);
+    ggml_flash_attn_ext_set_prec(kqv_compressed, GGML_PREC_F32);
+    kqv_compressed = ggml_permute(ctx0, kqv_compressed, 0, 2, 1, 3);
+    cb(kqv_compressed, "kqv_compressed", il);
+
+    // ---- expand back through wv_b ----
+    ggml_tensor * kqv = ggml_mul_mat(ctx0, layer.wv_b, kqv_compressed);
+    kqv = ggml_permute(ctx0, kqv, 0, 2, 1, 3);
+    kqv = ggml_cont_2d(ctx0, kqv, n_embd_head_v_mla * n_head, n_tokens);
+    cb(kqv, "kqv_merged", il);
+
+    // ---- K3's output gate, THEN the projection ----
+    // wo is deliberately not handed to the attention above: the gate has to land
+    // between the attention output and the projection.
+    if (layer.attn_gate) {
+        ggml_tensor * g = ggml_sigmoid(ctx0, ggml_mul_mat(ctx0, layer.attn_gate, inp_gate));
+        kqv = ggml_mul(ctx0, kqv, g);
+        cb(kqv, "attn_gated", il);
+    }
+
+    ggml_tensor * out = ggml_mul_mat(ctx0, layer.wo, kqv);
+
+    if (inp_out_ids) {
+        out = ggml_get_rows(ctx0, out, inp_out_ids);
+    }
+    return out;
 }
