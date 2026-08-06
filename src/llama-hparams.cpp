@@ -600,6 +600,12 @@ void llm_load_hparams(
                 ml.get_key(LLM_KV_EXPERT_SHARED_COUNT,         hparams.n_expert_shared);
                 ml.get_key(LLM_KV_EXPERT_WEIGHTS_SCALE,        hparams.expert_weights_scale, false);
                 ml.get_key(LLM_KV_EXPERT_WEIGHTS_NORM,         hparams.expert_weights_norm, false);
+                // MUST be read: the field defaults to SOFTMAX, and K3 routes with
+                // SIGMOID. Softmax over 896 experts yields probabilities around
+                // 1/896, which the ~0.03 exp_probs_b bias then swamps - so expert
+                // selection becomes almost token-independent and the model routes
+                // to nearly the same experts for every token.
+                ml.get_key(LLM_KV_EXPERT_GATING_FUNC,          hparams.expert_gating_func, false);
                 ml.get_key(LLM_KV_ATTENTION_Q_LORA_RANK,       hparams.n_lora_q);
                 ml.get_key(LLM_KV_ATTENTION_KV_LORA_RANK,      hparams.n_lora_kv);
                 ml.get_key(LLM_KV_ATTENTION_KEY_LENGTH_MLA,    hparams.n_embd_head_k_mla, false);
