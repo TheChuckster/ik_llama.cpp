@@ -152,10 +152,16 @@ ggml_cgraph * llm_build_context::build_kimi_k3() {
         // rather than failing (n_tokens % 1 == 0), quietly corrupting the final
         // residual on every prompt pass. AttnRes also banks full-width
         // checkpoints, so the narrowing has to happen after the last mix.
+        // KIMI_K3_MUTE_KDA / KIMI_K3_MUTE_MLA still BUILD the layer - so
+        // inp_s_seq_qnext and the caches stay referenced and the graph allocates -
+        // then zero its contribution to the residual. If muting a family IMPROVES
+        // perplexity, that family is actively harmful and holds the bug.
         if (hparams.is_recurrent(il)) {
             cur = build_kimi_k3_kda(gf, cur, nullptr, il);
+            if (getenv("KIMI_K3_MUTE_KDA")) cur = ggml_scale(ctx0, cur, 0.0f);
         } else {
             cur = build_kimi_k3_mla(gf, cur, KQ_mask, nullptr, kq_scale_mla, il);
+            if (getenv("KIMI_K3_MUTE_MLA")) cur = ggml_scale(ctx0, cur, 0.0f);
         }
 
         // THE subtle line. On a banking layer the running residual RESTARTS from
