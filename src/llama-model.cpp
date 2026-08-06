@@ -2630,7 +2630,11 @@ size_t llama_model::cache_size(int il, ggml_type type_k, ggml_type type_v, ggml_
         }
         return size;
     }
-    bool is_mla_attn = is_mla_model();
+    // Kimi-K3's 24 full-attention layers are MLA too: they cache the COMPRESSED
+    // kv (kv_lora_rank + rope = 576) and derive V from the same rows via wv_b.
+    // This is also why the GGUF's attention.value_length is nonsense - there is
+    // no separate V cache for it to describe.
+    bool is_mla_attn = is_mla_model() || arch == LLM_ARCH_KIMI_K3;
     if (is_mla_attn && mla_attn) {
         auto n_embd_head_qk_rope = hparams.n_rot;
         auto kv_lora_rank = hparams.n_lora_kv;
