@@ -608,10 +608,20 @@ void llm_load_hparams(
 
                 ml.get_key(LLM_KV_EXPERT_LATENT_LENGTH,        hparams.n_expert_latent);
                 ml.get_key(LLM_KV_KDA_HEAD_DIM,                hparams.kda_head_dim);
+                ml.get_key(LLM_KV_KDA_HEAD_DIM,                hparams.kda_head_dim);
                 ml.get_key(LLM_KV_KDA_GATE_LOWER_BOUND,        hparams.kda_gate_lower_bound);
                 ml.get_key(LLM_KV_ACTIVATION_SITU_BETA,        hparams.situ_beta);
                 ml.get_key(LLM_KV_ACTIVATION_SITU_LINEAR_BETA, hparams.situ_linear_beta);
                 ml.get_key(LLM_KV_ATTN_RES_BLOCK_SIZE,         hparams.attn_res_block_size);
+
+                // ik's delta-net helpers read Qwen3-Next's ssm_* hparams, which K3's
+                // GGUF does not set - it describes the same geometry with
+                // kda.head_dim instead. Populate them so those helpers are usable:
+                // 96 KDA heads of 128 channels each, no GQA.
+                hparams.ssm_d_state  = hparams.kda_head_dim;                 // 128
+                hparams.ssm_n_group  = hparams.n_head();                     // 96 k-heads
+                hparams.ssm_dt_rank  = hparams.n_head();                     // 96 v-heads
+                hparams.ssm_d_inner  = hparams.n_head() * hparams.kda_head_dim;  // 12288
 
                 // Which layers are KDA and which are full attention is DATA, not
                 // a pattern: head_count_kv is a per-layer ARRAY here (0 = KDA,
