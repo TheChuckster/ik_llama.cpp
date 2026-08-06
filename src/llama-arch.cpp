@@ -93,6 +93,7 @@ static const std::map<llm_arch, const char *> LLM_ARCH_NAMES = {
     { LLM_ARCH_GEMMA4_ASSISTANT,"gemma4-assistant"   },
     { LLM_ARCH_OPENPANGU,       "openpangu"    },
     { LLM_ARCH_MUSE_GLIMMER,    "muse-glimmer" },
+    { LLM_ARCH_KIMI_K3,         "kimi-k3"      },
     { LLM_ARCH_UNKNOWN,         "(unknown)"    },
 };
 
@@ -254,6 +255,13 @@ static const std::map<llm_kv, const char *> LLM_KV_NAMES = {
     { LLM_KV_SPLIT_COUNT,                   "split.count"         },
     { LLM_KV_SPLIT_TENSORS_COUNT,           "split.tensors.count" },
 
+    { LLM_KV_EXPERT_LATENT_LENGTH,          "%s.expert_latent_length"      },
+    { LLM_KV_KDA_HEAD_DIM,                  "%s.kda.head_dim"              },
+    { LLM_KV_KDA_GATE_LOWER_BOUND,          "%s.kda.gate_lower_bound"      },
+    { LLM_KV_ACTIVATION_SITU_BETA,          "%s.activation.situ_beta"        },
+    { LLM_KV_ACTIVATION_SITU_LINEAR_BETA,   "%s.activation.situ_linear_beta" },
+    { LLM_KV_ATTN_RES_BLOCK_SIZE,           "%s.attn_res.block_size"       },
+
     { LLM_KV_SSM_CONV_KERNEL,               "%s.ssm.conv_kernel"    },
     { LLM_KV_SSM_INNER_SIZE,                "%s.ssm.inner_size"     },
     { LLM_KV_SSM_STATE_SIZE,                "%s.ssm.state_size"     },
@@ -334,6 +342,8 @@ bool llm_arch_is_recurrent(const llm_arch & arch) {
 
 bool llm_arch_is_hybrid(const llm_arch & arch) {
     switch (arch) {
+    // 69 KDA (recurrent) layers interleaved with 24 full-attention ones.
+    case LLM_ARCH_KIMI_K3:
     case LLM_ARCH_QWEN3NEXT:
     case LLM_ARCH_QWEN35MOE:
     case LLM_ARCH_QWEN35:

@@ -91,6 +91,19 @@ struct llama_hparams {
     std::array<uint32_t, LLAMA_MAX_LAYERS> rope_dim_per_layer;
 
     // for State Space Models
+    // Kimi-K3
+    // MLA head widths. ik otherwise derives these from n_embd_head_k(0), which
+    // for K3 is the COMPRESSED MQA width (576 = kv_lora 512 + rope 64) rather
+    // than the per-head MLA width the q_b/v_b projections actually use.
+    uint32_t n_embd_head_k_mla = 0;     // 192
+    uint32_t n_embd_head_v_mla = 0;     // 128
+    uint32_t n_expert_latent   = 0;      // width the routed experts live at (3584)
+    uint32_t kda_head_dim      = 0;      // 128
+    uint32_t attn_res_block_size = 0;    // 12
+    float    kda_gate_lower_bound = 0.0f;   // -5.0
+    float    situ_beta            = 0.0f;   // 4.0
+    float    situ_linear_beta     = 0.0f;   // 25.0
+
     uint32_t ssm_d_conv  = 0;
     uint32_t ssm_d_inner = 0;
     uint32_t ssm_d_state = 0;

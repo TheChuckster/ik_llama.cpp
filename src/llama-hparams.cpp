@@ -592,6 +592,45 @@ void llm_load_hparams(
                     default: model.type = e_model::MODEL_UNKNOWN;
                 }
             } break;
+        case LLM_ARCH_KIMI_K3:
+            {
+                ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS, hparams.f_norm_rms_eps);
+                ml.get_key(LLM_KV_LEADING_DENSE_BLOCK_COUNT,   hparams.n_layer_dense_lead);
+                ml.get_key(LLM_KV_EXPERT_FEED_FORWARD_LENGTH,  hparams.n_ff_exp);
+                ml.get_key(LLM_KV_EXPERT_SHARED_COUNT,         hparams.n_expert_shared);
+                ml.get_key(LLM_KV_EXPERT_WEIGHTS_SCALE,        hparams.expert_weights_scale, false);
+                ml.get_key(LLM_KV_EXPERT_WEIGHTS_NORM,         hparams.expert_weights_norm, false);
+                ml.get_key(LLM_KV_ATTENTION_Q_LORA_RANK,       hparams.n_lora_q);
+                ml.get_key(LLM_KV_ATTENTION_KV_LORA_RANK,      hparams.n_lora_kv);
+                ml.get_key(LLM_KV_ATTENTION_KEY_LENGTH_MLA,    hparams.n_embd_head_k_mla, false);
+                ml.get_key(LLM_KV_ATTENTION_VALUE_LENGTH_MLA,  hparams.n_embd_head_v_mla, false);
+                ml.get_key(LLM_KV_SSM_CONV_KERNEL,             hparams.ssm_d_conv);
+
+                ml.get_key(LLM_KV_EXPERT_LATENT_LENGTH,        hparams.n_expert_latent);
+                ml.get_key(LLM_KV_KDA_HEAD_DIM,                hparams.kda_head_dim);
+                ml.get_key(LLM_KV_KDA_GATE_LOWER_BOUND,        hparams.kda_gate_lower_bound);
+                ml.get_key(LLM_KV_ACTIVATION_SITU_BETA,        hparams.situ_beta);
+                ml.get_key(LLM_KV_ACTIVATION_SITU_LINEAR_BETA, hparams.situ_linear_beta);
+                ml.get_key(LLM_KV_ATTN_RES_BLOCK_SIZE,         hparams.attn_res_block_size);
+
+                // Which layers are KDA and which are full attention is DATA, not
+                // a pattern: head_count_kv is a per-layer ARRAY here (0 = KDA,
+                // 1 = full attention). Qwen3-Next above can hardcode
+                // "every 4th layer", and doing that for K3 would be wrong - its
+                // full-attention layers are 3, 7, ... 87, 91 AND 92, so the last
+                // one breaks the stride.
+                std::array<uint32_t, LLAMA_MAX_LAYERS> n_head_kv_arr;
+                n_head_kv_arr.fill(0);
+                ml.get_key_or_arr(LLM_KV_ATTENTION_HEAD_COUNT_KV, n_head_kv_arr, hparams.n_layer, false);
+                for (uint32_t i = 0; i < hparams.n_layer; ++i) {
+                    hparams.recurrent_layer_arr[i] = (n_head_kv_arr[i] == 0);
+                }
+
+                switch (hparams.n_layer) {
+                    case 93: model.type = e_model::MODEL_UNKNOWN; break;
+                    default: model.type = e_model::MODEL_UNKNOWN;
+                }
+            } break;
         case LLM_ARCH_QWEN3NEXT:
             {
                 ml.get_key(LLM_KV_EXPERT_FEED_FORWARD_LENGTH,        hparams.n_ff_exp, false);
