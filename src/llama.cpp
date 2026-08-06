@@ -7999,6 +7999,7 @@ struct llama_model_quantize_params llama_model_quantize_default_params() {
         /*.only_repack                    =*/ false,
         /*.dry_run                        =*/ false,
         /*.partial_requant                =*/ false,
+        /*.keep_f32                       =*/ false,
         /*.imatrix                        =*/ nullptr,
         /*.kv_overrides                   =*/ nullptr,
         /*.custom_quants                  =*/ nullptr,
