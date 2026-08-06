@@ -13,6 +13,7 @@
 #include <chrono>
 #include <functional>
 #include <map>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -20,6 +21,24 @@ using chat_template_caps = jinja::caps;
 using json = nlohmann::ordered_json;
 
 struct common_chat_templates;
+
+// Thrown when the *request* is malformed — the caller's fault, not the server's.
+//
+// The distinction is not cosmetic. An error thrown out of request parsing reaches the
+// server's global exception handler, which cannot tell "your JSON is broken" from "the
+// server hit an internal fault" and so reports every one of them as HTTP 500. 500 is a
+// retryable status: every OpenAI-compatible client, including the official SDKs, will
+// back off and resend. When the fault is deterministic — a malformed value the client
+// keeps replaying in its conversation history — that retry never succeeds and never
+// stops. One observed session logged 9,992 identical 500s over 5.6 hours before hitting
+// an unrelated iteration cap.
+//
+// Throwing this type instead makes the response a 400, which clients do not retry, so a
+// bad request fails once and says why.
+class common_chat_request_error : public std::runtime_error {
+  public:
+    using std::runtime_error::runtime_error;
+};
 
 namespace autoparser {
 struct generation_params;
