@@ -89,6 +89,7 @@ enum llm_arch {
     LLM_ARCH_GEMMA4_ASSISTANT,
     LLM_ARCH_OPENPANGU,
     LLM_ARCH_MUSE_GLIMMER,
+    LLM_ARCH_KIMI_K3,
     LLM_ARCH_UNKNOWN,
 };
 
@@ -221,6 +222,16 @@ enum llm_kv {
     LLM_KV_SPLIT_COUNT,
     LLM_KV_SPLIT_TENSORS_COUNT,
 
+    // Kimi-K3. n_ff_exp carries the expert intermediate width; the LATENT width
+    // the experts actually live at is separate and narrower than the residual
+    // stream, so it needs its own key.
+    LLM_KV_EXPERT_LATENT_LENGTH,
+    LLM_KV_KDA_HEAD_DIM,
+    LLM_KV_KDA_GATE_LOWER_BOUND,
+    LLM_KV_ACTIVATION_SITU_BETA,
+    LLM_KV_ACTIVATION_SITU_LINEAR_BETA,
+    LLM_KV_ATTN_RES_BLOCK_SIZE,
+
     LLM_KV_SSM_INNER_SIZE,
     LLM_KV_SSM_CONV_KERNEL,
     LLM_KV_SSM_STATE_SIZE,
@@ -343,7 +354,11 @@ enum llm_tensor {
     LLM_TENSOR_SSM_BETA_ALPHA,
     LLM_TENSOR_SSM_ALPHA,
     LLM_TENSOR_SSM_BETA,                    // 50
+    // Kimi-K3's full-rank KDA forget gate adds a second low-rank projection;
+    // its three split convolution tensors are declared with the other SSM
+    // convolution tensors above.
     LLM_TENSOR_SSM_F_A,
+    LLM_TENSOR_SSM_F_B,
     LLM_TENSOR_SSM_G_A,
     LLM_TENSOR_SSM_F,
     LLM_TENSOR_SSM_G,
@@ -417,6 +432,25 @@ enum llm_tensor {
     LLM_TENSOR_HC_FFN_BASE,
     LLM_TENSOR_HC_FFN_FN,
     LLM_TENSOR_HC_FFN_SCALE,
+
+    // Kimi-K3. AttnRes replaces the plain residual add at two sites per layer.
+    // Only one [n_embd] vector per site is needed: the RMSNorm weight and the
+    // projection weight collapse into a single constant, and unsloth's converter
+    // already ships them folded.
+    LLM_TENSOR_ATTN_RES_SCORE,
+    LLM_TENSOR_FFN_RES_SCORE,
+    // ...and one more at the model level, for the final output. AttnRes runs at
+    // every residual site, and the output is a site too.
+    LLM_TENSOR_OUTPUT_RES_SCORE,
+    // Kimi-K3 latent MoE: the routed experts live at a narrower width than the
+    // residual stream, so the block down-projects into that width and back out.
+    LLM_TENSOR_FFN_ROUTED_DOWN,
+    LLM_TENSOR_FFN_ROUTED_NORM,
+    LLM_TENSOR_FFN_ROUTED_UP,
+    // K3's gated MLA needs no new tensor: LLM_TENSOR_ATTN_GATE already exists
+    // and already maps to "blk.%d.attn_gate". What is K3-specific is only that
+    // the gate is computed from the LAYER INPUT rather than the attention
+    // output - a graph-builder concern, not a naming one.
 
     LLM_TENSOR_PER_LAYER_TOKEN_EMBD,
     LLM_TENSOR_PER_LAYER_MODEL_PROJ,

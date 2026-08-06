@@ -80,6 +80,7 @@ struct create_tensors_helper : public create_tensors_helper_interface {
     bool create_mellum_tensors(const LLM_TN & tn);
 
     bool create_qwen3next_tensors(const LLM_TN & tn);
+    bool create_kimi_k3_tensors(const LLM_TN & tn);
 
     bool create_qwen35moe_tensors(const LLM_TN & tn);
 
@@ -1574,6 +1575,115 @@ bool create_tensors_helper::create_mellum_tensors(const LLM_TN & tn) {
         use_mmap_buffer &= !create_std_ffn_exps(n_embd, tn, i, 0, 0, ffn_ctx);
     }
     return use_mmap_buffer;
+}
+
+bool create_tensors_helper::create_kimi_k3_tensors(const LLM_TN & tn) {
+    LOADING_PRELUDE
+    model.tok_embd = create_tensor(ctx_input, tn(LLM_TENSOR_TOKEN_EMBD, "weight"), {n_embd, n_vocab});
+
+    {
+        model.output_norm = create_tensor(ctx_output, tn(LLM_TENSOR_OUTPUT_NORM, "weight"), {n_embd});
+        model.output      = create_tensor(ctx_output, tn(LLM_TENSOR_OUTPUT,      "weight"), {n_embd, n_vocab}, llama_model_loader::TENSOR_NOT_REQUIRED);
+        if (model.output == NULL) {
+            model.output = create_tensor(ctx_output, tn(LLM_TENSOR_TOKEN_EMBD, "weight"), {n_embd, n_vocab}, llama_model_loader::TENSOR_DUPLICATED);
+        }
+        model.output_res_score = create_tensor(ctx_output, tn(LLM_TENSOR_OUTPUT_RES_SCORE, "weight"), {n_embd});
+    }
+
+    // KDA geometry. n_head is the KDA head count (96) and kda_head_dim is 128,
+    // so the q/k/v projections are all n_embd -> 12288 and the three short
+    // convolutions operate on that same width.
+    const int64_t kda_hd    = hparams.kda_head_dim;
+    const int64_t kda_dim   = kda_hd * n_head;
+    const int64_t d_conv    = hparams.ssm_d_conv;
+
+    // MLA geometry, as DeepSeek-style: q_b emits n_head * key_length_mla and the
+    // output projection consumes n_head * value_length_mla.
+    const int64_t n_embd_head_qk_rope = hparams.n_rot;
+    const int64_t n_embd_head_k_mla   = hparams.n_embd_head_k_mla ? hparams.n_embd_head_k_mla : n_embd_head_k;
+    const int64_t n_embd_head_v_mla   = hparams.n_embd_head_v_mla ? hparams.n_embd_head_v_mla : n_embd_head_v;
+    const int64_t n_embd_head_qk_nope = n_embd_head_k_mla - hparams.n_rot;
+    const int64_t q_lora_rank  = hparams.n_lora_q;
+    const int64_t kv_lora_rank = hparams.n_lora_kv;
+    // Latent MoE: routed experts live at n_expert_latent (3584), not n_embd.
+    const int64_t n_latent   = hparams.n_expert_latent;
+    const int64_t n_ff_exp   = hparams.n_ff_exp;
+    const int64_t n_ff_shexp = n_ff_exp * hparams.n_expert_shared;
+
+    for (int i = 0; i < n_layer; ++i) {
+        ggml_context * ctx_layer = ctx_for_layer(i);
+        ggml_context * ctx_split = ctx_for_layer_split(i);
+
+        auto & layer = model.layers[i];
+
+        layer.attn_norm = create_tensor(ctx_layer, tn(LLM_TENSOR_ATTN_NORM, "weight", i), {n_embd});
+        layer.ffn_norm  = create_tensor(ctx_layer, tn(LLM_TENSOR_FFN_NORM,  "weight", i), {n_embd});
+
+        // AttnRes: already folded to one vector per site by the converter.
+        layer.attn_res_score = create_tensor(ctx_layer, tn(LLM_TENSOR_ATTN_RES_SCORE, "weight", i), {n_embd});
+        layer.ffn_res_score  = create_tensor(ctx_layer, tn(LLM_TENSOR_FFN_RES_SCORE,  "weight", i), {n_embd});
+
+        if (hparams.is_recurrent(i)) {
+            // ---- KDA (linear attention) layer ----
+            layer.wq = create_tensor(ctx_split, tn(LLM_TENSOR_ATTN_Q,   "weight", i), {n_embd, kda_dim});
+            layer.wk = create_tensor(ctx_split, tn(LLM_TENSOR_ATTN_K,   "weight", i), {n_embd, kda_dim});
+            layer.wv = create_tensor(ctx_split, tn(LLM_TENSOR_ATTN_V,   "weight", i), {n_embd, kda_dim});
+            layer.wo = create_tensor(ctx_split, tn(LLM_TENSOR_ATTN_OUT, "weight", i), {kda_dim, n_embd});
+
+            layer.ssm_conv1d_q = create_tensor(ctx_layer, tn(LLM_TENSOR_SSM_CONV1D_Q, "weight", i), {d_conv, 1, kda_dim});
+            layer.ssm_conv1d_k = create_tensor(ctx_layer, tn(LLM_TENSOR_SSM_CONV1D_K, "weight", i), {d_conv, 1, kda_dim});
+            layer.ssm_conv1d_v = create_tensor(ctx_layer, tn(LLM_TENSOR_SSM_CONV1D_V, "weight", i), {d_conv, 1, kda_dim});
+
+            // A_log is per HEAD (96). The gate becomes per-CHANNEL only because
+            // f_a -> f_b produces n_head * kda_head_dim values per token, which
+            // is also why dt has that many biases.
+            layer.ssm_a    = create_tensor(ctx_layer, tn(LLM_TENSOR_SSM_A,    i),           {n_head});
+            layer.ssm_dt_b = create_tensor(ctx_layer, tn(LLM_TENSOR_SSM_DT,   "bias", i),   {kda_dim});
+            layer.ssm_beta = create_tensor(ctx_split, tn(LLM_TENSOR_SSM_BETA, "weight", i), {n_embd, n_head});
+            layer.ssm_f_a  = create_tensor(ctx_split, tn(LLM_TENSOR_SSM_F_A,  "weight", i), {n_embd, kda_hd});
+            layer.ssm_f_b  = create_tensor(ctx_split, tn(LLM_TENSOR_SSM_F_B,  "weight", i), {kda_hd, kda_dim});
+            layer.ssm_g    = create_tensor(ctx_split, tn(LLM_TENSOR_SSM_G,    "weight", i), {n_embd, kda_dim});
+            layer.ssm_norm = create_tensor(ctx_layer, tn(LLM_TENSOR_SSM_NORM, "weight", i), {kda_hd});
+        } else {
+            // ---- full-attention (gated MLA) layer ----
+            layer.wq_a       = create_tensor(ctx_split, tn(LLM_TENSOR_ATTN_Q_A,      "weight", i), {n_embd, q_lora_rank});
+            layer.attn_q_a_norm = create_tensor(ctx_layer, tn(LLM_TENSOR_ATTN_Q_A_NORM, "weight", i), {q_lora_rank});
+            layer.wq_b       = create_tensor(ctx_split, tn(LLM_TENSOR_ATTN_Q_B,      "weight", i), {q_lora_rank, n_head * n_embd_head_k_mla});
+            layer.wkv_a_mqa  = create_tensor(ctx_split, tn(LLM_TENSOR_ATTN_KV_A_MQA, "weight", i), {n_embd, kv_lora_rank + n_embd_head_qk_rope});
+            layer.attn_kv_a_norm = create_tensor(ctx_layer, tn(LLM_TENSOR_ATTN_KV_A_NORM, "weight", i), {kv_lora_rank});
+            layer.wk_b       = create_tensor(ctx_split, tn(LLM_TENSOR_ATTN_K_B,      "weight", i), {n_embd_head_qk_nope, kv_lora_rank, n_head});
+            layer.wv_b       = create_tensor(ctx_split, tn(LLM_TENSOR_ATTN_V_B,      "weight", i), {kv_lora_rank, n_embd_head_v_mla, n_head});
+            layer.wo         = create_tensor(ctx_split, tn(LLM_TENSOR_ATTN_OUT,      "weight", i), {n_head * n_embd_head_v_mla, n_embd});
+            // Gate is computed from the LAYER INPUT, hence n_embd on the input side.
+            layer.attn_gate  = create_tensor(ctx_split, tn(LLM_TENSOR_ATTN_GATE,     "weight", i), {n_embd, n_head * n_embd_head_v_mla});
+        }
+
+        if (i < (int) hparams.n_layer_dense_lead) {
+            // dense FFN prefix
+            layer.ffn_gate = create_tensor(ctx_split, tn(LLM_TENSOR_FFN_GATE, "weight", i), {n_embd,   n_ff});
+            layer.ffn_up   = create_tensor(ctx_split, tn(LLM_TENSOR_FFN_UP,   "weight", i), {n_embd,   n_ff});
+            layer.ffn_down = create_tensor(ctx_split, tn(LLM_TENSOR_FFN_DOWN, "weight", i), {n_ff, n_embd});
+        } else {
+            // latent MoE. Router and shared experts see the FULL residual width;
+            // the routed experts live at n_latent, with down/up either side.
+            layer.ffn_gate_inp   = create_tensor(ctx_layer, tn(LLM_TENSOR_FFN_GATE_INP,    "weight", i), {n_embd, n_expert});
+            layer.ffn_exp_probs_b= create_tensor(ctx_layer, tn(LLM_TENSOR_FFN_EXP_PROBS_B, "bias",   i), {n_expert});
+
+            layer.ffn_routed_down = create_tensor(ctx_split, tn(LLM_TENSOR_FFN_ROUTED_DOWN, "weight", i), {n_embd, n_latent});
+            layer.ffn_routed_norm = create_tensor(ctx_layer, tn(LLM_TENSOR_FFN_ROUTED_NORM, "weight", i), {n_latent});
+            layer.ffn_routed_up   = create_tensor(ctx_split, tn(LLM_TENSOR_FFN_ROUTED_UP,   "weight", i), {n_latent, n_embd});
+
+            layer.ffn_gate_exps = create_tensor(ctx_split, tn(LLM_TENSOR_FFN_GATE_EXPS, "weight", i), {n_latent, n_ff_exp, n_expert});
+            layer.ffn_down_exps = create_tensor(ctx_split, tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", i), {n_ff_exp, n_latent, n_expert});
+            layer.ffn_up_exps   = create_tensor(ctx_split, tn(LLM_TENSOR_FFN_UP_EXPS,   "weight", i), {n_latent, n_ff_exp, n_expert});
+
+            layer.ffn_gate_shexp = create_tensor(ctx_split, tn(LLM_TENSOR_FFN_GATE_SHEXP, "weight", i), {n_embd, n_ff_shexp});
+            layer.ffn_up_shexp   = create_tensor(ctx_split, tn(LLM_TENSOR_FFN_UP_SHEXP,   "weight", i), {n_embd, n_ff_shexp});
+            layer.ffn_down_shexp = create_tensor(ctx_split, tn(LLM_TENSOR_FFN_DOWN_SHEXP, "weight", i), {n_ff_shexp, n_embd});
+        }
+    }
+
+    return true;
 }
 
 bool create_tensors_helper::create_qwen3next_tensors(const LLM_TN & tn) {
@@ -5210,6 +5320,8 @@ bool create_tensors_helper::create_tensors() {
             use_mmap_buffer = create_mellum_tensors(tn); break;
         case LLM_ARCH_QWEN3NEXT:
             use_mmap_buffer = create_qwen3next_tensors(tn); break;
+        case LLM_ARCH_KIMI_K3:
+            use_mmap_buffer = create_kimi_k3_tensors(tn); break;
         case LLM_ARCH_QWEN35MOE:
             use_mmap_buffer = create_qwen35moe_tensors(tn); break;
         case LLM_ARCH_QWEN35:
