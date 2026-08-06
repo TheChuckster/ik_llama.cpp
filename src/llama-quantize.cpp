@@ -1512,6 +1512,14 @@ static void llama_model_quantize_internal(const std::string & fname_inp, const s
 
         // do not quantize Mamba's small yet 2D weights
         // NOTE: can't use LLM_TN here because the layer number is not known
+        // Match the PREFIX, not "ssm_conv1d.weight": Kimi K3 has a separate
+        // conv per projection (ssm_conv1d_q/_k/_v.weight) and the literal name
+        // never matched, so its conv weights were eligible for quantization.
+        // They are 4 columns wide, so they cannot take a k-quant and
+        // change_type_if_necessary silently fell them back from F32 to Q8_0 -
+        // whereupon ggml_ssm_conv aborts on GGML_ASSERT(src2->nb[0] ==
+        // sizeof(float)) at the first token. Quantizing a 4-wide kernel saves
+        // nothing anyway.
         quantize &= name.find("ssm_conv1d")        == std::string::npos;
         quantize &= name.find("ssm_x.weight")      == std::string::npos;
         quantize &= name.find("ssm_dt.weight")     == std::string::npos;
