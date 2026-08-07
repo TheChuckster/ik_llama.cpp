@@ -393,6 +393,25 @@ ggml_tensor * llm_build_context::build_kimi_k3_kda(ggml_cgraph * gf, ggml_tensor
     const bool reset_state = batch.pos != nullptr && batch.pos[0] == 0;
     const uint32_t state_seq_id = (batch.seq_id && batch.seq_id[0]) ? (uint32_t) batch.seq_id[0][0] : 0u;
 
+    // Both values above are read from token 0 and applied to the whole batch,
+    // which is only correct while a batch carries a single sequence.
+    // delta_net::build_layer_attn_linear has a second path for mixed-sequence
+    // batches - a per-token loop with its own reset_state and seq id each - and
+    // this builder does not implement it.
+    //
+    // Assert rather than quietly mis-attribute the recurrent state: a batch
+    // spanning two sequences would run both through sequence 0's KDA state,
+    // which produces plausible text rather than an error. That is the same
+    // failure shape as the per-step checkpoints above, and it costs nothing to
+    // refuse. --parallel 1 (the served configuration) never trips it.
+    if (batch.seq_id != nullptr) {
+        for (int32_t i = 1; i < batch.n_tokens; ++i) {
+            GGML_ASSERT(batch.seq_id[i] != nullptr);
+            GGML_ASSERT((uint32_t) batch.seq_id[i][0] == state_seq_id &&
+                        "kimi-k3 does not support mixed-sequence batches; run with --parallel 1");
+        }
+    }
+
     // Per-step recurrent checkpoints, which this call used to omit entirely by
     // letting build_qkv's two trailing arguments default to nullptr.
     //
