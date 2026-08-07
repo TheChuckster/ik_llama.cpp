@@ -202,6 +202,18 @@ llama_build_and_test(
 )
 llama_build_and_test(test-regex-partial.cpp)
 
+# ggml_delta_net's per-head forget gate, at three head dims on purpose:
+# iqk_fused_delta_net only accepts 64 and 128, so 8 is the only way to reach the
+# portable path in ggml.c. The two disagreed about gate layout and nothing caught
+# it, because on x86 a per-head gate never reaches the portable path.
+foreach(HD 8 64 128)
+    add_executable(test-delta-net-gate-${HD} test-delta-net-gate.c)
+    target_compile_definitions(test-delta-net-gate-${HD} PRIVATE HEAD_DIM=${HD})
+    target_link_libraries(test-delta-net-gate-${HD} PRIVATE ggml m)
+    add_test(NAME test-delta-net-gate-${HD} COMMAND $<TARGET_FILE:test-delta-net-gate-${HD}>)
+    set_property(TEST test-delta-net-gate-${HD} PROPERTY LABELS main)
+endforeach()
+
 # llama_target_and_test(test-opt.cpp) # SLOW
 
 llama_target_and_test(test-model-load-cancel.cpp  LABEL "model")

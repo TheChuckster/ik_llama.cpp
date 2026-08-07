@@ -23943,7 +23943,21 @@ static void ggml_compute_forward_delta_net_f32(
         const int64_t qkv_head_offset  = batch_idx * (head_dim * n_tokens * n_heads) + head_idx * (head_dim * n_tokens);
         const int64_t qkv_head_offset_kq = batch_idx * (head_dim * n_tokens * n_heads/gqa_ratio) + head_idx_kq * (head_dim * n_tokens);
         const int64_t qkv_token_stride = head_dim;
-        const int64_t g_head_offset    = batch_idx * (n_tokens * n_heads) + head_idx * n_tokens;
+        // The gate and beta are read HEAD-fastest, not token-fastest.
+        //
+        // build_fused_delta_net permutes both WITHOUT ggml_cont, so the pointer
+        // that arrives here is the pre-permute buffer and the real layout is
+        // [n_heads, n_tokens, n_seqs] - successive tokens are n_heads apart, not
+        // adjacent. iqk_fused_delta_net already reads it this way
+        // (g_data[batch*n_tokens*n_heads + t*n_heads + head]); this path read it
+        // as head_idx * n_tokens + t, which is the transpose.
+        //
+        // Nothing noticed because on x86 a per-head gate always takes the fused
+        // kernel. Anything reaching this code with one - a non-x86 build, or a
+        // head_dim other than 64 or 128 - gets silently wrong results rather
+        // than a failure.
+        const int64_t g_head_offset    = batch_idx * (n_tokens * n_heads) + head_idx;
+        const int64_t g_token_stride   = n_heads;
         const int64_t state_head_offset = batch_idx * (head_dim * head_dim * n_heads) + head_idx * (head_dim * head_dim);
         const int64_t out_head_offset  = batch_idx * (head_dim * n_heads * n_tokens) + head_idx * head_dim;
         const int64_t out_token_stride = head_dim * n_heads;
@@ -23960,8 +23974,8 @@ static void ggml_compute_forward_delta_net_f32(
             const float * k_t = k_data + qkv_head_offset_kq + t * qkv_token_stride;
             const float * v_t = v_data + qkv_head_offset + t * qkv_token_stride;
 
-            const float g_val    = g_data[g_head_offset + t];
-            const float beta_raw = beta_data[g_head_offset + t];
+            const float g_val    = g_data[g_head_offset + t * g_token_stride];
+            const float beta_raw = beta_data[g_head_offset + t * g_token_stride];
 
             float q_norm_sq = 0.0f;
             float k_norm_sq = 0.0f;
