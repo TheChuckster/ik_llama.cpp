@@ -23960,10 +23960,29 @@ static void ggml_compute_forward_delta_net_f32(
         // are not adjacent. Hence the channel stride below rather than a plain
         // g_t[col]; it is 0 for a per-head gate, which collapses every channel
         // read back onto the single scalar.
-        const int64_t g_width          = gate_per_channel ? head_dim : 1;
+        // The two gate kinds do not arrive in the same layout, and this used to
+        // assume they did.
+        //
+        // A PER-CHANNEL gate is ggml_cont'd by build_fused_delta_net, so it is
+        // genuinely [n_tokens, head_dim, n_heads, n_seqs] - token-fastest, with
+        // successive channels a whole n_tokens apart.
+        //
+        // A PER-HEAD gate is permuted WITHOUT ggml_cont, so this pointer is the
+        // pre-permute buffer and the real layout is head-fastest: index
+        // t*n_heads + head. Reading it token-fastest, as this did, transposes
+        // the gate and beta - silently, with plausible output. It never showed
+        // up because on x86 a per-head gate always takes iqk_fused_delta_net,
+        // which reads it head-fastest and is correct; only a non-x86 build or a
+        // head_dim other than 64/128 reaches this code with one.
         const int64_t g_chan_stride    = gate_per_channel ? n_tokens : 0;
-        const int64_t g_head_offset    = (batch_idx * (n_tokens * n_heads) + head_idx * n_tokens) * g_width;
-        const int64_t beta_head_offset = batch_idx * (n_tokens * n_heads) + head_idx * n_tokens;
+        const int64_t g_head_offset    = gate_per_channel
+                                       ? (batch_idx * (n_tokens * n_heads) + head_idx * n_tokens) * head_dim
+                                       :  batch_idx * (n_tokens * n_heads) + head_idx;
+        const int64_t g_tok_stride     = gate_per_channel ? 1 : n_heads;
+        const int64_t beta_head_offset = gate_per_channel
+                                       ? batch_idx * (n_tokens * n_heads) + head_idx * n_tokens
+                                       : batch_idx * (n_tokens * n_heads) + head_idx;
+        const int64_t beta_tok_stride  = gate_per_channel ? 1 : n_heads;
         const int64_t state_head_offset = batch_idx * (head_dim * head_dim * n_heads) + head_idx * (head_dim * head_dim);
         const int64_t out_head_offset  = batch_idx * (head_dim * n_heads * n_tokens) + head_idx * head_dim;
         const int64_t out_token_stride = head_dim * n_heads;
@@ -23980,8 +23999,8 @@ static void ggml_compute_forward_delta_net_f32(
             const float * k_t = k_data + qkv_head_offset_kq + t * qkv_token_stride;
             const float * v_t = v_data + qkv_head_offset + t * qkv_token_stride;
 
-            const float * g_t    = g_data + g_head_offset + t;
-            const float beta_raw = beta_data[beta_head_offset + t];
+            const float * g_t    = g_data + g_head_offset + t * g_tok_stride;
+            const float beta_raw = beta_data[beta_head_offset + t * beta_tok_stride];
 
             float q_norm_sq = 0.0f;
             float k_norm_sq = 0.0f;
