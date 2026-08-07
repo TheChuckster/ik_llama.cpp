@@ -1225,6 +1225,8 @@ static void llama_model_quantize_internal(const std::string & fname_inp, const s
     int n_to_repack = 0, n_to_modify = 0;
     const std::vector<std::string> * repack_pattern = nullptr;
     if (params->repack_pattern) repack_pattern = (const std::vector<std::string> *)params->repack_pattern;
+    const std::vector<std::string> * keep_pattern = nullptr;
+    if (params->keep_pattern) keep_pattern = (const std::vector<std::string> *)params->keep_pattern;
 
     for (int i = 0; i < ml.n_tensors; ++i) {
         const struct ggml_tensor * meta = ml.get_tensor_meta(i);
@@ -1469,6 +1471,36 @@ static void llama_model_quantize_internal(const std::string & fname_inp, const s
         quantize &= params->quantize_output_tensor || name != "output.weight";
         quantize &= !params->only_copy;
 
+        // --keep-f32: a tensor that arrives as F32 in an already-quantized model
+        // is F32 because the publisher chose that, and the choice is usually
+        // load-bearing - GLM-DSA's indexer.proj scores which tokens attention
+        // sees, K3's ssm_conv1d is asserted F32 by ggml_ssm_conv. They are also
+        // uniformly tiny, so quantizing them buys nothing and can break the
+        // model or quietly degrade it. Only meaningful when requantizing; on a
+        // real F32 source model this would quantize nothing, hence opt-in.
+        if (params->keep_f32 && tensor->type == GGML_TYPE_F32) {
+            quantize = false;
+        }
+
+        // --keep-pattern: copy these tensors through byte for byte.
+        //
+        // There is no "same type" shortcut in this function - asking for a type
+        // a tensor already has still dequantizes and requantizes it, which for
+        // an IQ2_XS expert is hours of work and a lossy round trip to produce
+        // (nearly) what was already there. That makes "requantize only the
+        // non-expert tensors" impossible to express, which matters because on a
+        // model like Kimi K3 the experts are 93% of the file and 19% of what a
+        // token reads: the tensors worth requantizing are exactly the ones a
+        // whole-file pass spends all its time NOT changing.
+        if (keep_pattern) {
+            for (auto & r : *keep_pattern) {
+                if (std::regex_search(tensor->name, std::regex(r))) {
+                    quantize = false;
+                    break;
+                }
+            }
+        }
+
         // do not quantize expert gating tensors
         // NOTE: can't use LLM_TN here because the layer number is not known
         if (name.find("ffn_gate_inp.weight") != std::string::npos) {
@@ -1484,7 +1516,15 @@ static void llama_model_quantize_internal(const std::string & fname_inp, const s
 
         // do not quantize Mamba's small yet 2D weights
         // NOTE: can't use LLM_TN here because the layer number is not known
-        quantize &= name.find("ssm_conv1d.weight") == std::string::npos;
+        // Match the PREFIX, not "ssm_conv1d.weight": Kimi K3 has a separate
+        // conv per projection (ssm_conv1d_q/_k/_v.weight) and the literal name
+        // never matched, so its conv weights were eligible for quantization.
+        // They are 4 columns wide, so they cannot take a k-quant and
+        // change_type_if_necessary silently fell them back from F32 to Q8_0 -
+        // whereupon ggml_ssm_conv aborts on GGML_ASSERT(src2->nb[0] ==
+        // sizeof(float)) at the first token. Quantizing a 4-wide kernel saves
+        // nothing anyway.
+        quantize &= name.find("ssm_conv1d")        == std::string::npos;
         quantize &= name.find("ssm_x.weight")      == std::string::npos;
         quantize &= name.find("ssm_dt.weight")     == std::string::npos;
 
