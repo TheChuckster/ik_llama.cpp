@@ -379,6 +379,13 @@ ggml_tensor * llm_build_context::build_kimi_k3_kda(ggml_cgraph * gf, ggml_tensor
     const uint32_t slots = llama_kv_qnext_state_slots(lctx.kv_self);
     GGML_ASSERT(slots > 0);
 
+    // Same condition delta_net's constructor uses: per-step snapshots only
+    // exist for multi-token batches, and only up to what was allocated.
+    const int max_per_step = lctx.kv_self.save_per_step_ssm
+                           ? lctx.kv_self.ckpt.per_step_max_allocated : 0;
+    const bool save_per_step_states = lctx.kv_self.save_per_step_ssm &&
+                                      batch.n_tokens > 1 && batch.n_tokens <= max_per_step;
+
     // The recurrent state MUST be cleared at the start of a sequence. Passing a
     // constant false here leaves the KDA state as whatever was in the buffer,
     // which is exactly the kind of bug that produces fluent-shaped nonsense
@@ -386,10 +393,34 @@ ggml_tensor * llm_build_context::build_kimi_k3_kda(ggml_cgraph * gf, ggml_tensor
     const bool reset_state = batch.pos != nullptr && batch.pos[0] == 0;
     const uint32_t state_seq_id = (batch.seq_id && batch.seq_id[0]) ? (uint32_t) batch.seq_id[0][0] : 0u;
 
+    // Per-step recurrent checkpoints, which this call used to omit entirely by
+    // letting build_qkv's two trailing arguments default to nullptr.
+    //
+    // Without them the KDA state is never snapshotted per draft step, so when
+    // speculative decoding rejects a draft there is nothing to roll back to and
+    // the recurrent state carries the rejected tokens forward. The result is not
+    // a crash: it is fluent-shaped drift that compounds into repetition loops -
+    // 0/5 tool calls with speculation on, against 5/5 without. Qwen3-Next was
+    // never affected because llama-delta-net.cpp has always passed these.
+    //
+    // save_per_step_states is only true for multi-token batches, so a plain
+    // single-token decode is unchanged.
+    ggml_tensor * per_step_ssm = nullptr;
+    ggml_tensor * per_step_conv = nullptr;
+    if (save_per_step_states) {
+        if (il < (int) lctx.kv_self.ckpt.per_step_ssm.size() && !lctx.kv_self.ckpt.per_step_ssm[il].empty()) {
+            per_step_ssm = lctx.kv_self.ckpt.per_step_ssm[il].front();
+        }
+        if (il < (int) lctx.kv_self.ckpt.per_step_conv.size() && !lctx.kv_self.ckpt.per_step_conv[il].empty()) {
+            per_step_conv = lctx.kv_self.ckpt.per_step_conv[il].front();
+        }
+    }
+
     ggml_tensor * out = delta_net::build_qkv(ctx0, lctx.kv_self.s_l[il], conv_w,
             qkv_mixed, lctx.inp_s_seq_qnext, beta, g,
             head_dim, n_head_kda, head_dim, n_head_kda, hparams.ssm_d_conv,
-            state_seq_id, slots, reset_state, eps, 1, il, cb, gf);
+            state_seq_id, slots, reset_state, eps, 1, il, cb, gf,
+            per_step_ssm, per_step_conv);
     cb(out, "kda_out", il);
 
     // ---- output gate, norm, projection ----
