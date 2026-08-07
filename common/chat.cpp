@@ -1455,12 +1455,17 @@ static common_chat_params common_chat_params_init_kimi_k3(const common_chat_temp
                        p.tool_close(p.literal(CALL_CLOSE))));
         });
 
-        auto min_calls = inputs.tool_choice == COMMON_CHAT_TOOL_CHOICE_REQUIRED ? 1 : 0;
         auto max_calls = inputs.parallel_tool_calls ? -1 : 1;
-        auto tools = p.trigger_rule("tool-calls",
+        // Deliberately optional even for tool_choice=required, and deliberately
+        // NOT backed by a generated grammar. Both were tried: constraining
+        // generation to the parser's shape took tool emission from 3/5 to 1/4
+        // with required and 0/4 with auto's lazy grammar. K3 appears to fight
+        // the constraint rather than be guided by it, so the parser stays
+        // permissive and the model is left alone.
+        auto tools = p.optional(p.trigger_rule("tool-calls",
             p.literal(TOOLS_OPEN) + p.space() +
-            p.repeat(tool_choice + p.space(), min_calls < 1 ? 1 : min_calls, max_calls) +
-            p.optional(p.literal(TOOLS_CLOSE)));
+            p.repeat(tool_choice + p.space(), 1, max_calls) +
+            p.optional(p.literal(TOOLS_CLOSE))));
 
         // The response section is OPTIONAL when tools are in play. K3 usually
         // emits an empty one before the tool block, but not always - going
@@ -1470,7 +1475,7 @@ static common_chat_params common_chat_params_init_kimi_k3(const common_chat_temp
         // call rather than reporting anything.
         auto response = p.optional(p.literal(RESP_OPEN) + p.content(p.until(RESP_CLOSE)) +
                                    p.optional(p.literal("<|close|>response<|sep|>")));
-        return reasoning << response << p.optional(tools) << p.rest();
+        return reasoning << response << tools << p.rest();
     });
 
     data.parser = parser.save();
