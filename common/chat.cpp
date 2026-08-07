@@ -1362,123 +1362,130 @@ static common_chat_params common_chat_params_init_kimi_k3(const common_chat_temp
     data.format            = COMMON_CHAT_FORMAT_PEG_NATIVE;
     data.supports_thinking = true;
 
-    const std::string MSG_OPEN    = "<|open|>message role=\"assistant\"<|sep|>";
-    const std::string THINK_OPEN  = "<|open|>think<|sep|>";
-    const std::string THINK_CLOSE = "<|close|>think<|sep|>";
-    const std::string RESP_OPEN   = "<|open|>response<|sep|>";
-    const std::string RESP_CLOSE  = "<|close|>";
+    const std::string SEP         = "<|sep|>";
+    const std::string MSG_START   = "<|open|>message role=\"assistant\"<|sep|>";
+    const std::string THINK_START = "<|open|>think<|sep|>";
+    const std::string THINK_END   = "<|close|>think<|sep|>";
+    const std::string RESP_START  = "<|open|>response<|sep|>";
+    const std::string RESP_END    = "<|close|>response<|sep|>";
+    const std::string TOOLS_START = "<|open|>tools<|sep|>";
+    const std::string TOOLS_END   = "<|close|>tools<|sep|>";
+    const std::string CALL_START  = "<|open|>call tool=\"";
+    const std::string CALL_END    = "<|close|>call<|sep|>";
+    const std::string ARG_START   = "<|open|>argument key=\"";
+    const std::string ARG_END     = "<|close|>argument<|sep|>";
+    const std::string MSG_END     = "<|close|>message<|sep|>";
+    const std::string EOM_TOKEN   = "<|end_of_msg|>";
 
-    data.thinking_start_tag = THINK_OPEN;
-    data.thinking_end_tag   = THINK_CLOSE;
+    // Only the four markers are special tokens. Tag names ("think", "response")
+    // are ordinary text and must NOT be preserved, or prose containing those
+    // words gets mangled.
     data.preserved_tokens   = { "<|open|>", "<|sep|>", "<|close|>", "<|end_of_msg|>" };
+    data.thinking_start_tag = THINK_START;
+    data.thinking_end_tag   = THINK_END;
 
-    // K3 does not emit JSON tool calls. It nests the same open/sep/close tags it
-    // uses for everything else, one tag per ARGUMENT, with the value as tag body:
-    //
-    //   <|open|>tools<|sep|>
-    //     <|open|>call tool="get_weather" index="1"<|sep|>
-    //       <|open|>argument key="city" type="string"<|sep|>Oslo<|close|>argument<|sep|>
-    //     <|close|>call<|sep|>
-    //   <|close|>tools<|sep|>
-    //
-    // Both `call` and `argument` carry an attribute AFTER the one we match on
-    // (index=, type=), so each opener is "prefix, name, then skip to <|sep|>"
-    // rather than the fixed prefix/suffix pair standard_constructed_tools
-    // assumes - which is why this is hand-rolled rather than using that helper.
-    const std::string SEP        = "<|sep|>";
-    const std::string TOOLS_OPEN  = "<|open|>tools<|sep|>";
-    const std::string TOOLS_CLOSE = "<|close|>tools<|sep|>";
-    const std::string CALL_OPEN   = "<|open|>call tool=\"";
-    const std::string CALL_CLOSE  = "<|close|>call<|sep|>";
-    const std::string ARG_OPEN    = "<|open|>argument key=\"";
-    const std::string ARG_CLOSE   = "<|close|>argument<|sep|>";
-
+    auto has_tools         = inputs.tools.is_array() && !inputs.tools.empty();
     auto extract_reasoning = inputs.reasoning_format != COMMON_REASONING_FORMAT_NONE && inputs.enable_thinking;
-    auto has_tools         = inputs.tools.is_array() && !inputs.tools.empty() &&
-                             inputs.tool_choice != COMMON_CHAT_TOOL_CHOICE_NONE;
+    auto include_grammar   = has_tools && inputs.tool_choice != COMMON_CHAT_TOOL_CHOICE_NONE;
 
     auto parser = build_chat_peg_parser([&](common_chat_peg_builder & p) -> common_peg_parser {
-        // The whole reasoning block is optional: the message opener, the think
-        // section, or both may be absent depending on how the turn was rendered.
-        auto reasoning = extract_reasoning
-            ? p.optional(p.optional(p.literal(MSG_OPEN)) + THINK_OPEN + p.reasoning(p.until(THINK_CLOSE)) + THINK_CLOSE)
-            : p.eps();
+        auto end   = p.end();
+        auto start = p.optional(p.literal(MSG_START));
 
-        // No tools: unchanged from before tool support existed. Everything past
-        // the response close is message-level framing.
-        if (!has_tools) {
-            return reasoning << RESP_OPEN << p.content(p.until(RESP_CLOSE)) << p.rest();
+        // The think section is ALWAYS consumed, even with reasoning extraction
+        // off: K3's generation prompt ends inside the think opener, so it is
+        // present on every request and would otherwise leak into content.
+        // Reasoning stops at its own closer OR at the response opener, because
+        // the model skips the closer outright on short answers.
+        auto think_body = extract_reasoning ? p.reasoning(p.until_one_of({ THINK_END, RESP_START }))
+                                            : p.content(p.until_one_of({ THINK_END, RESP_START }));
+        auto reasoning  = p.optional(p.optional(p.literal(THINK_START)) + think_body +
+                                     p.optional(p.literal(THINK_END)));
+
+        // Content runs to the response closer, or to whatever comes next when a
+        // truncated generation never emits one. Listing TOOLS_START here is what
+        // lets a pure tool call - think straight to tools, no response section -
+        // parse at all.
+        auto response = p.optional(p.literal(RESP_START)) +
+                        p.content(p.until_one_of({ RESP_END, TOOLS_START, MSG_END })) +
+                        p.optional(p.literal(RESP_END));
+
+        auto trailer = p.optional(p.literal(MSG_END)) + p.optional(p.literal(EOM_TOKEN));
+
+        if (!has_tools || inputs.tool_choice == COMMON_CHAT_TOOL_CHOICE_NONE) {
+            return start + reasoning + response + trailer + end;
         }
 
-        auto tool_choice = p.choice();
+        auto tool_choices = p.choice();
         foreach_function(inputs.tools, [&](const json & tool) {
             const auto & function = tool.at("function");
             std::string  name     = function.at("name");
-            json         params   = function.contains("parameters") ? function.at("parameters") : json::object();
+            const json   schema   = function.contains("parameters") ? function.at("parameters") : json::object();
 
+            // One tag per argument, with the JSON type in a type="..." attribute.
+            // The tool schema is authoritative for that type, not the attribute:
+            // it decides whether the body is quoted as a string or passed through
+            // as JSON.
             auto args = p.eps();
-            if (params.contains("properties") && !params["properties"].empty()) {
-                auto arg_choice = p.choice();
-                for (const auto & el : params["properties"].items()) {
-                    const std::string & prop = el.key();
-                    // The declared type decides how the body is emitted into the
-                    // arguments JSON: a string body has to be quoted and escaped,
-                    // anything else is already valid JSON (number, bool, object).
-                    std::string type = el.value().is_object() && el.value().contains("type")
-                                           ? el.value().at("type").get<std::string>()
-                                           : "string";
-                    auto body = p.until(ARG_CLOSE);
-                    auto value = type == "string" ? p.tool_arg_string_value(body) : p.tool_arg_value(body);
-
-                    arg_choice |= p.tool_arg(
-                        p.tool_arg_open(p.literal(ARG_OPEN) + p.tool_arg_name(p.literal(prop)) +
-                                        p.literal("\"") + p.until(SEP) + p.literal(SEP)) +
-                        value +
-                        p.tool_arg_close(p.literal(ARG_CLOSE)));
+            if (schema.contains("properties") && !schema.at("properties").empty()) {
+                auto arg_choices = p.choice();
+                for (const auto & prop : schema.at("properties").items()) {
+                    const std::string & key = prop.key();
+                    std::string type = "string";
+                    if (prop.value().is_object() && prop.value().contains("type") &&
+                        prop.value().at("type").is_string()) {
+                        type = prop.value().at("type").get<std::string>();
+                    }
+                    auto value = type == "string" ? p.tool_arg_string_value(p.until(ARG_END))
+                                                  : p.tool_arg_value(p.until(ARG_END));
+                    // p.until(SEP) skips the trailing type="..." attribute.
+                    arg_choices |= p.rule("kimi-k3-arg-" + name + "-" + key,
+                                          p.tool_arg(p.tool_arg_open(p.literal(ARG_START)) +
+                                                     p.tool_arg_name(p.literal(key)) + p.literal("\"") +
+                                                     p.until(SEP) + p.literal(SEP) + value +
+                                                     p.tool_arg_close(p.literal(ARG_END))));
                 }
-                // Catch-all LAST (PEG choice is ordered): a model that emits an
-                // argument outside the schema would otherwise leave the call
-                // rule unable to reach its closer, failing the whole parse and
-                // silently dropping a tool call that was actually emitted.
-                arg_choice |= p.tool_arg(
-                    p.tool_arg_open(p.literal(ARG_OPEN) + p.tool_arg_name(p.until("\"")) +
-                                    p.literal("\"") + p.until(SEP) + p.literal(SEP)) +
-                    p.tool_arg_string_value(p.until(ARG_CLOSE)) +
-                    p.tool_arg_close(p.literal(ARG_CLOSE)));
-                args = p.zero_or_more(arg_choice + p.space());
+                args = p.zero_or_more(arg_choices);
             }
 
-            tool_choice |= p.rule("tool-" + name,
-                p.tool(p.tool_open(p.literal(CALL_OPEN) + p.tool_name(p.literal(name)) +
-                                   p.literal("\"") + p.until(SEP) + p.literal(SEP)) +
-                       p.space() + p.tool_args(args) + p.space() +
-                       p.tool_close(p.literal(CALL_CLOSE))));
+            // Same skip for the trailing index="N".
+            auto call = p.tool(p.tool_open(p.literal(CALL_START) + p.tool_name(p.literal(name)) +
+                                           p.literal("\"") + p.until(SEP) + p.literal(SEP)) +
+                               p.tool_args(args) + p.tool_close(p.literal(CALL_END)));
+
+            tool_choices |= p.rule("kimi-k3-tool-" + name, call);
         });
 
-        auto max_calls = inputs.parallel_tool_calls ? -1 : 1;
-        // Deliberately optional even for tool_choice=required, and deliberately
-        // NOT backed by a generated grammar. Both were tried: constraining
-        // generation to the parser's shape took tool emission from 3/5 to 1/4
-        // with required and 0/4 with auto's lazy grammar. K3 appears to fight
-        // the constraint rather than be guided by it, so the parser stays
-        // permissive and the model is left alone.
-        auto tools = p.optional(p.trigger_rule("tool-calls",
-            p.literal(TOOLS_OPEN) + p.space() +
-            p.repeat(tool_choice + p.space(), 1, max_calls) +
-            p.optional(p.literal(TOOLS_CLOSE))));
+        // The message closer belongs INSIDE the trigger rule. Without it a lazy
+        // grammar rejects the model's own closing tag once tool calls have
+        // started, which kills the generation mid-call - measured at 0/4 before
+        // this was understood.
+        auto tools_section = p.trigger_rule("kimi-k3-tool-call",
+            p.literal(TOOLS_START) + p.one_or_more(tool_choices) + p.literal(TOOLS_END) +
+            p.optional(p.literal(MSG_END)) + p.optional(p.literal(EOM_TOKEN)));
 
-        // The response section is OPTIONAL when tools are in play. K3 usually
-        // emits an empty one before the tool block, but not always - going
-        // straight from the think section to <|open|>tools<|sep|> is normal
-        // when the turn is a pure tool call. Requiring it here failed the whole
-        // parse in exactly that case, and a failed parse silently swallows the
-        // call rather than reporting anything.
-        auto response = p.optional(p.literal(RESP_OPEN) + p.content(p.until(RESP_CLOSE)) +
-                                   p.optional(p.literal("<|close|>response<|sep|>")));
-        return reasoning << response << tools << p.rest();
+        auto tools = inputs.tool_choice == COMMON_CHAT_TOOL_CHOICE_REQUIRED ? tools_section
+                                                                           : p.optional(tools_section);
+
+        return start + reasoning + response + tools + trailer + end;
     });
 
     data.parser = parser.save();
+
+    if (include_grammar) {
+        data.grammar_lazy = inputs.tool_choice != COMMON_CHAT_TOOL_CHOICE_REQUIRED;
+        data.grammar      = build_grammar([&](const common_grammar_builder & builder) {
+            foreach_function(inputs.tools, [&](const json & tool) {
+                const auto & function = tool.at("function");
+                if (function.contains("parameters")) {
+                    auto schema = function.at("parameters");
+                    builder.resolve_refs(schema);
+                }
+            });
+            parser.build_grammar(builder, data.grammar_lazy);
+        });
+        data.grammar_triggers = { { COMMON_GRAMMAR_TRIGGER_TYPE_WORD, TOOLS_START } };
+    }
 
     return data;
 }
