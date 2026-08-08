@@ -732,6 +732,13 @@ extern "C" {
     // cannot see (--swa-compress). Matches the gate the engine applies before a K-shift.
     LLAMA_API bool llama_supports_ctx_shift(const struct llama_context * ctx);
 
+    // Granularity at which a cached prefix may be reused when the above returns
+    // false. 0 = no safe granularity, reuse nothing.
+    LLAMA_API uint32_t llama_model_kv_reuse_alignment(const struct llama_model * model);
+
+    // false when the context cannot serialize whole-context or file-session state (--swa-compress); per-sequence buffer state is unaffected
+    LLAMA_API bool llama_supports_full_state_io(const struct llama_context * ctx);
+
     LLAMA_API const char * llama_model_arch_string(const struct llama_model * model);
 
     // Returns 0 on success
