@@ -2367,7 +2367,25 @@ bool llama_model_supports_ctx_shift(const struct llama_model * model) {
 }
 
 bool llama_model_supports_partial_kv_reuse(const struct llama_model * model) {
-    return model != nullptr;
+    // Same hazard as llama_model_supports_ctx_shift() above, and the same two
+    // architectures: they keep position-dependent private state outside the
+    // generic KV cache (DeepSeek4's DSA indexer cache, openPangu's MoME conv
+    // slot). Partial reuse keeps the cache rows before a mid-sequence divergence
+    // and drops the rest, but that side state is NOT rebuilt for the reused
+    // span, so attention runs against indexer state belonging to a prompt that
+    // no longer exists.
+    //
+    // This returned true for every model, so the guard in the server that exists
+    // precisely to catch this ("per-position side state past the divergence
+    // point is already lost") could never fire. The observed symptom was a
+    // DeepSeek-V4 agent session collapsing into a repetition loop several turns
+    // in - reproducible by replaying a captured request sequence in order, and
+    // absent when the same sequence is replayed with cache_prompt=false.
+    //
+    // Pure extension of a cached sequence is unaffected: the server only
+    // consults this when n_past < cache_tokens.size(), i.e. when the cache
+    // actually diverges mid-sequence.
+    return model && model->arch != LLM_ARCH_OPENPANGU && model->arch != LLM_ARCH_DEEPSEEK4;
 }
 
 llm_tensor llm_tensor_type(llm_arch arch, const std::string & tensor_name, int il) {

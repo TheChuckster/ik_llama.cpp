@@ -3973,13 +3973,23 @@ void server_context::batch_pending_prompt(const int32_t n_ubatch, const int32_t 
                             slot.n_past = prefix.first;
                             slot.n_past_prompt = prefix.second;
                             slot.n_past_offset = slot.n_past_prompt - slot.n_past;
-                            if (!llama_model_supports_partial_kv_reuse(model) &&
-                                slot.n_past < (int32_t) slot.cache_tokens.size()) {
-                                // the cache diverges from the new prompt mid-sequence; this
-                                // model can only extend or reset a cached sequence (per-position
-                                // side state past the divergence point is already lost)
-                                LLAMA_LOG_INFO("%s: cached sequence diverges at %d/%d and this model does not support partial KV reuse - reprocessing from scratch\n",
-                                        __func__, (int) slot.n_past, (int) slot.cache_tokens.size());
+                            if (!llama_model_supports_partial_kv_reuse(model) && slot.n_past > 0) {
+                                // These architectures keep position-dependent private state
+                                // outside the generic KV cache (DeepSeek4's DSA indexer cache,
+                                // openPangu's MoME conv slot), and that state is not carried
+                                // across requests with the KV rows. Reusing ANY cached prefix
+                                // therefore runs attention against side state belonging to a
+                                // prompt that no longer exists.
+                                //
+                                // This originally only fired when the cache diverged
+                                // mid-sequence. That was too narrow, and measurably so: a
+                                // DeepSeek-V4 agent request that PURELY EXTENDED its cache
+                                // (n_past 17007 == cache_size 17007, 43 new tokens) still
+                                // collapsed into an 8000-token repetition loop, while the same
+                                // request with cache_prompt=false was clean. Divergence was
+                                // never the trigger; reuse was.
+                                LLAMA_LOG_INFO("%s: model keeps position-dependent state outside the KV cache - reprocessing %d cached tokens from scratch\n",
+                                        __func__, (int) slot.n_past);
                                 slot.n_past = 0;
                                 slot.n_past_prompt = 0;
                                 slot.n_past_offset = 0;
