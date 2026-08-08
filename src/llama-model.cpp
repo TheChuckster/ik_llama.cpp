@@ -2366,6 +2366,24 @@ bool llama_model_supports_ctx_shift(const struct llama_model * model) {
     return model && model->arch != LLM_ARCH_OPENPANGU && model->arch != LLM_ARCH_DEEPSEEK4;
 }
 
+// Granularity at which a cached prefix may be reused for architectures that keep
+// blockwise position-dependent state outside the generic KV cache. Reusing a
+// prefix that ends mid-block leaves the compressor's running state inconsistent
+// with where the next batch starts.
+//
+// DeepSeek-V4 compresses with CSA_RATIO 4 and HCA_RATIO 128 (llama-context.h), so
+// 128 is the coarser of the two and aligning to it satisfies both. Returning 0
+// means "no safe granularity known" - the caller must then reuse nothing.
+uint32_t llama_model_kv_reuse_alignment(const struct llama_model * model) {
+    if (!model) {
+        return 0;
+    }
+    if (model->arch == LLM_ARCH_DEEPSEEK4) {
+        return 128; // HCA_RATIO, a multiple of CSA_RATIO
+    }
+    return 0;       // openPangu: block structure not established here, reuse nothing
+}
+
 bool llama_model_supports_partial_kv_reuse(const struct llama_model * model) {
     // Same hazard as llama_model_supports_ctx_shift() above, and the same two
     // architectures: they keep position-dependent private state outside the
