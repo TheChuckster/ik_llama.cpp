@@ -3981,6 +3981,24 @@ void server_context::batch_pending_prompt(const int32_t n_ubatch, const int32_t 
                             slot.n_past_prompt = prefix.second;
                             slot.n_past_offset = slot.n_past_prompt - slot.n_past;
                             if (!llama_model_supports_partial_kv_reuse(model) && slot.n_past > 0) {
+                                // These architectures keep blockwise position-dependent state
+                                // outside the KV cache. Reuse is safe only up to a block
+                                // boundary, so round the reuse point DOWN rather than throwing
+                                // the whole prefix away - the difference is reprocessing <=127
+                                // tokens instead of 17000.
+                                const uint32_t align = llama_model_kv_reuse_alignment(model);
+                                if (align > 1) {
+                                    const int32_t back = slot.n_past % (int32_t) align;
+                                    if (back > 0) {
+                                        // roll both streams back by the same token count so
+                                        // n_past_offset (prompt - cache) is preserved
+                                        slot.n_past        -= back;
+                                        slot.n_past_prompt -= back;
+                                    }
+                                    LLAMA_LOG_INFO("%s: aligning cached prefix reuse to %u-token blocks: n_past %d (dropped %d)\n",
+                                            __func__, align, (int) slot.n_past, (int) back);
+                                    slot.n_past_offset = slot.n_past_prompt - slot.n_past;
+                                } else {
                                 // These architectures keep position-dependent private state
                                 // outside the generic KV cache (DeepSeek4's DSA indexer cache,
                                 // openPangu's MoME conv slot), and that state is not carried
@@ -3995,11 +4013,12 @@ void server_context::batch_pending_prompt(const int32_t n_ubatch, const int32_t 
                                 // collapsed into an 8000-token repetition loop, while the same
                                 // request with cache_prompt=false was clean. Divergence was
                                 // never the trigger; reuse was.
-                                LLAMA_LOG_INFO("%s: model keeps position-dependent state outside the KV cache - reprocessing %d cached tokens from scratch\n",
+                                LLAMA_LOG_INFO("%s: model keeps position-dependent state outside the KV cache and has no known safe reuse granularity - reprocessing %d cached tokens from scratch\n",
                                         __func__, (int) slot.n_past);
                                 slot.n_past = 0;
                                 slot.n_past_prompt = 0;
                                 slot.n_past_offset = 0;
+                                }
                             }
 
                             if (slot.n_past > 0 && slot.spec != nullptr &&
