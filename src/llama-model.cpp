@@ -2509,10 +2509,12 @@ uint32_t llama_model_kv_reuse_alignment(const struct llama_model * model) {
         //   CSA/LID running-state ring 2*CSA_RATIO = 8   (pos % 8)
         //   HCA block ratio          128
         //   HCA running-state ring   HCA_RATIO  = 128    (pos % 128)
-        // DSV4_REUSE_ALIGN overrides it, for proving necessity/sufficiency only.
-        static const char * env = getenv("DSV4_REUSE_ALIGN");
-        static const uint32_t forced = env ? (uint32_t) atoi(env) : 0;
-        return forced ? forced : 128;
+        //
+        // Conservative rather than proven minimal: a 64-token alignment also held
+        // on the reproduction, so the true period may be smaller. Over-estimating
+        // costs a few dozen tokens of prefill; under-estimating corrupts state, so
+        // this stays at the lcm until something proves a smaller one safe.
+        return 128;
     }
     return 0;       // openPangu: block structure not established here, reuse nothing
 }
