@@ -2184,7 +2184,33 @@ static common_chat_params common_chat_params_init_deepseek_v3_2(const common_cha
             parser.build_grammar(builder, data.grammar_lazy);
         });
 
+        // Trigger on the DSML block OPENER, not on the complete "<|DSML|tool_calls>".
+        //
+        // With only the WORD trigger, the grammar engaged only once the whole tag
+        // had been emitted. A model that starts the marker and then drifts - seen
+        // in captured traffic as "<|DSML|tool/bin/echo done</|DSML|parameter>"
+        // followed by invented closers like </|DSML|tool_package> - never matches
+        // it. So the grammar never engages, nothing constrains the rest, the parser
+        // correctly refuses to parse it, the tool call is lost, and the raw markers
+        // leak into content.
+        //
+        // Triggering on a prefix is safe because llama_grammar_accept_impl REPLAYS
+        // the matched text into the grammar from the match offset, so as long as the
+        // pattern is a proper prefix of FC_START the grammar picks up mid-tag and
+        // forces the completion to be exactly FC_START.
+        //
+        // The pattern is "<|DSML|tool" and not the bare "<|DSML|" deliberately. The
+        // bare opener was tried first and fires too widely: a model that merely
+        // QUOTES a marker while reasoning ("the token <|DSML|invoke means...") then
+        // gets forced into a tool call it was explicitly asked not to make, and one
+        // such case produced mangled content. "<|DSML|tool" still matches the failure
+        // this exists for - captured as "<|DSML|tool/bin/echo done" - while leaving
+        // prose about invoke/parameter alone.
+        //
+        // The WORD trigger is kept too: harmless, since every FC_START contains the
+        // prefix, and it keeps the intent legible.
         data.grammar_triggers = {
+            { COMMON_GRAMMAR_TRIGGER_TYPE_PATTERN, "<" + DSML + TC_BLOCK.substr(0, 4) },
             { COMMON_GRAMMAR_TRIGGER_TYPE_WORD, FC_START },
         };
     }
