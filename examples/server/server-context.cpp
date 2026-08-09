@@ -3980,26 +3980,31 @@ void server_context::batch_pending_prompt(const int32_t n_ubatch, const int32_t 
                             slot.n_past = prefix.first;
                             slot.n_past_prompt = prefix.second;
                             slot.n_past_offset = slot.n_past_prompt - slot.n_past;
-                            const uint32_t reuse_align_dbg = llama_model_kv_reuse_alignment(model);
-                            if (!llama_model_supports_partial_kv_reuse(model) && slot.n_past > 0
-                                && reuse_align_dbg != 1) {   // ==1: experimental bypass, unsafe
+                            if (!llama_model_supports_partial_kv_reuse(model) && slot.n_past > 0) {
                                 // These architectures keep blockwise position-dependent state
                                 // outside the KV cache. Reuse is safe only up to a block
                                 // boundary, so round the reuse point DOWN rather than throwing
                                 // the whole prefix away - the difference is reprocessing <=127
                                 // tokens instead of 17000.
                                 const uint32_t align = llama_model_kv_reuse_alignment(model);
-                                if (align > 1) {
+                                // n_past indexes the CACHE, n_past_prompt the PROMPT. They are
+                                // not the same stream: when think tokens are excluded from the
+                                // match they advance at different rates, and they differ in
+                                // about 13% of requests here (88 of 667 observed). So rolling
+                                // the cache back by N tokens is NOT a rollback of N prompt
+                                // tokens, and subtracting N from both - which this did at
+                                // first - lands n_past_prompt on the wrong token.
+                                //
+                                // Only take the aligned-reuse path when the two are in lock
+                                // step, where a token-count rollback is exact. Otherwise reset
+                                // rather than guess: correctness over the prefill saving.
+                                if (align > 1 && slot.n_past == slot.n_past_prompt) {
                                     const int32_t back = slot.n_past % (int32_t) align;
-                                    if (back > 0) {
-                                        // roll both streams back by the same token count so
-                                        // n_past_offset (prompt - cache) is preserved
-                                        slot.n_past        -= back;
-                                        slot.n_past_prompt -= back;
-                                    }
+                                    slot.n_past        -= back;
+                                    slot.n_past_prompt -= back;
+                                    slot.n_past_offset = 0;   // still in lock step
                                     LLAMA_LOG_INFO("%s: aligning cached prefix reuse to %u-token blocks: n_past %d (dropped %d)\n",
                                             __func__, align, (int) slot.n_past, (int) back);
-                                    slot.n_past_offset = slot.n_past_prompt - slot.n_past;
                                 } else {
                                 // These architectures keep position-dependent private state
                                 // outside the generic KV cache (DeepSeek4's DSA indexer cache,
