@@ -3971,7 +3971,9 @@ void server_context::batch_pending_prompt(const int32_t n_ubatch, const int32_t 
                             slot.n_past = prefix.first;
                             slot.n_past_prompt = prefix.second;
                             slot.n_past_offset = slot.n_past_prompt - slot.n_past;
-                            if (!llama_model_supports_partial_kv_reuse(model) && slot.n_past > 0) {
+                            const uint32_t reuse_align_dbg = llama_model_kv_reuse_alignment(model);
+                            if (!llama_model_supports_partial_kv_reuse(model) && slot.n_past > 0
+                                && reuse_align_dbg != 1) {   // ==1: experimental bypass, unsafe
                                 // These architectures keep blockwise position-dependent state
                                 // outside the KV cache. Reuse is safe only up to a block
                                 // boundary, so round the reuse point DOWN rather than throwing

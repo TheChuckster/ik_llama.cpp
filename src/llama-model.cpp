@@ -2504,7 +2504,15 @@ uint32_t llama_model_kv_reuse_alignment(const struct llama_model * model) {
         return 0;
     }
     if (model->arch == LLM_ARCH_DEEPSEEK4) {
-        return 128; // HCA_RATIO, a multiple of CSA_RATIO
+        // 128 = lcm of every period in the DSV4 state machinery:
+        //   CSA block ratio            4
+        //   CSA/LID running-state ring 2*CSA_RATIO = 8   (pos % 8)
+        //   HCA block ratio          128
+        //   HCA running-state ring   HCA_RATIO  = 128    (pos % 128)
+        // DSV4_REUSE_ALIGN overrides it, for proving necessity/sufficiency only.
+        static const char * env = getenv("DSV4_REUSE_ALIGN");
+        static const uint32_t forced = env ? (uint32_t) atoi(env) : 0;
+        return forced ? forced : 128;
     }
     return 0;       // openPangu: block structure not established here, reuse nothing
 }
