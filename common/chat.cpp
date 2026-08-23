@@ -1384,6 +1384,15 @@ static common_chat_params common_chat_params_init_kimi_k3(const common_chat_temp
     data.thinking_start_tag = THINK_START;
     data.thinking_end_tag   = THINK_END;
 
+    // K3 sometimes emits the message closer repeatedly instead of following it
+    // with <|end_of_msg|> (its configured EOG token).  Besides wasting the
+    // entire output budget, the duplicate trailer makes the strict PEG parser
+    // reject an otherwise complete answer and fall back to raw tagged content.
+    // Stop on the first complete message closer.  The parser deliberately makes
+    // the trailer optional, so removing this stop sequence from the returned
+    // text is safe for normal answers and tool calls alike.
+    data.additional_stops = { MSG_END };
+
     auto has_tools         = inputs.tools.is_array() && !inputs.tools.empty();
     auto extract_reasoning = inputs.reasoning_format != COMMON_REASONING_FORMAT_NONE && inputs.enable_thinking;
     auto include_grammar   = has_tools && inputs.tool_choice != COMMON_CHAT_TOOL_CHOICE_NONE;
