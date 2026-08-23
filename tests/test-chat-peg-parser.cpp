@@ -1068,20 +1068,145 @@ static void test_kimi_k3_message_end_stop(testing & t) {
     if (!t.assert_equal("K3 stops at message closer", message_end, params.additional_stops.front())) {
         return;
     }
+    t.assert_equal("K3 generation prompt",
+                   std::string("<|open|>message role=\"assistant\"<|sep|><|open|>think<|sep|>"),
+                   params.generation_prompt);
 
-    // llama-server removes a matched stop string before parsing. Verify that
-    // this deliberately absent trailer still yields clean reasoning and content.
-    common_peg_arena arena;
-    arena.load(params.parser);
-    common_chat_parser_params parser_params(params);
-    const auto parsed = common_chat_peg_parse(
-        arena,
+    // Streaming must withhold every proper prefix of the stop, regardless of
+    // where tokenizer boundaries land. Once a prefix diverges, it is ordinary
+    // content again and must not be held indefinitely.
+    const std::string before_stop = "payload:";
+    for (size_t n = 1; n < message_end.size(); ++n) {
+        const auto partial = before_stop + message_end.substr(0, n);
+        t.assert_equal("K3 partial stop at byte " + std::to_string(n),
+                       before_stop.size(), string_find_partial_stop(partial, message_end));
+    }
+    t.assert_equal("K3 divergent stop prefix is content", std::string::npos,
+                   string_find_partial_stop(before_stop + "<|clx", message_end));
+
+    auto parse = [](const common_chat_params & chat_params, const std::string & output) {
+        common_peg_arena arena;
+        arena.load(chat_params.parser);
+        common_chat_parser_params parser_params(chat_params);
+        return common_chat_peg_parse(arena, output, /* is_partial= */ false, parser_params);
+    };
+
+    auto assert_incremental_clean = [&t](const std::string &                 label,
+                                         const common_chat_params &          chat_params,
+                                         const std::string &                 output) {
+        common_peg_arena arena;
+        arena.load(chat_params.parser);
+        common_chat_parser_params parser_params(chat_params);
+        bool clean = true;
+        for (size_t n = 0; n <= output.size(); ++n) {
+            try {
+                const auto partial = common_chat_peg_parse(
+                    arena, output.substr(0, n), /* is_partial= */ true, parser_params);
+                if (partial.reasoning_content.find("<|") != std::string::npos ||
+                    partial.content.find("<|") != std::string::npos) {
+                    t.log(label + " leaked a structural marker at byte " + std::to_string(n));
+                    clean = false;
+                    break;
+                }
+            } catch (const std::exception & e) {
+                t.log(label + " threw at byte " + std::to_string(n) + ": " + e.what());
+                clean = false;
+                break;
+            }
+        }
+        t.assert_equal(label, true, clean);
+    };
+
+    // llama-server removes a matched stop string before parsing. Verify the
+    // deliberately absent trailer across the response shapes K3 emits.
+    const std::string stopped_response_output =
         "Keep this brief.<|close|>think<|sep|>"
-        "<|open|>response<|sep|>Hi there!<|close|>response<|sep|>",
-        /* is_partial= */ false,
-        parser_params);
+        "<|open|>response<|sep|>Hi there!<|close|>response<|sep|>";
+    const auto parsed = parse(params, stopped_response_output);
     t.assert_equal("K3 stopped reasoning", std::string("Keep this brief."), parsed.reasoning_content);
     t.assert_equal("K3 stopped content", std::string("Hi there!"), parsed.content);
+    assert_incremental_clean("K3 stopped response streams cleanly", params, stopped_response_output);
+
+    // Both inner section closers are optional in real K3 output. The message
+    // stop is still safe when either is omitted.
+    const auto no_think_close = parse(
+        params,
+        "Reasoning without its closer."
+        "<|open|>response<|sep|>Answer.<|close|>response<|sep|>");
+    t.assert_equal("K3 stopped reasoning without think closer",
+                   std::string("Reasoning without its closer."), no_think_close.reasoning_content);
+    t.assert_equal("K3 stopped content without think closer", std::string("Answer."), no_think_close.content);
+
+    const auto no_response_close = parse(
+        params,
+        "Reasoning.<|close|>think<|sep|>"
+        "<|open|>response<|sep|>Answer without its closer.");
+    t.assert_equal("K3 stopped content without response closer",
+                   std::string("Answer without its closer."), no_response_close.content);
+
+    // Preserve compatibility with the canonical path where K3 does emit both
+    // the message trailer and its configured EOG token (offline parsing and
+    // callers that do not install additional_stops still rely on this).
+    // common_chat_peg_parse prepends params.generation_prompt, just as the
+    // server does before applying the parser, so the generated suffix starts
+    // at the reasoning body here.
+    const auto canonical = parse(
+        params,
+        "Canonical reasoning.<|close|>think<|sep|>"
+        "<|open|>response<|sep|>Canonical answer.<|close|>response<|sep|>"
+        "<|close|>message<|sep|><|end_of_msg|>");
+    t.assert_equal("K3 canonical reasoning", std::string("Canonical reasoning."), canonical.reasoning_content);
+    t.assert_equal("K3 canonical content", std::string("Canonical answer."), canonical.content);
+
+    // A tool response reaches the same message stop, but its closer is nested
+    // inside the lazy grammar trigger. Verify stop removal does not lose the
+    // call, its typed arguments, or its finishable parse in either grammar mode.
+    const common_chat_tool weather_tool{
+        "get_weather",
+        "Get current weather",
+        R"({"type":"object","properties":{"city":{"type":"string"},"days":{"type":"integer"}},"required":["city"]})",
+    };
+    inputs.tools       = { weather_tool };
+    inputs.tool_choice = COMMON_CHAT_TOOL_CHOICE_AUTO;
+    const auto auto_tool_params = common_chat_templates_apply(tmpls.get(), inputs);
+    t.assert_equal("K3 auto tool grammar is lazy", true, auto_tool_params.grammar_lazy);
+    t.assert_equal("K3 auto tool grammar exists", false, auto_tool_params.grammar.empty());
+    if (!t.assert_equal("K3 auto tool has one message stop", size_t(1),
+                        auto_tool_params.additional_stops.size())) {
+        return;
+    }
+    t.assert_equal("K3 auto tool keeps message stop", message_end, auto_tool_params.additional_stops.front());
+
+    const std::string stopped_tool_output =
+        "Need weather data.<|close|>think<|sep|>"
+        "<|open|>response<|sep|><|close|>response<|sep|>"
+        "<|open|>tools<|sep|>"
+        "<|open|>call tool=\"get_weather\" index=\"0\"<|sep|>"
+        "<|open|>argument key=\"city\" type=\"string\"<|sep|>Oslo<|close|>argument<|sep|>"
+        "<|open|>argument key=\"days\" type=\"integer\"<|sep|>3<|close|>argument<|sep|>"
+        "<|close|>call<|sep|><|close|>tools<|sep|>";
+    const auto stopped_tool = parse(auto_tool_params, stopped_tool_output);
+    t.assert_equal("K3 stopped tool reasoning", std::string("Need weather data."), stopped_tool.reasoning_content);
+    t.assert_equal("K3 stopped tool content", std::string(), stopped_tool.content);
+    if (t.assert_equal("K3 stopped tool count", size_t(1), stopped_tool.tool_calls.size())) {
+        t.assert_equal("K3 stopped tool name", std::string("get_weather"), stopped_tool.tool_calls[0].name);
+        t.assert_equal("K3 stopped typed tool args", std::string("{\"city\":\"Oslo\",\"days\":3}"),
+                       stopped_tool.tool_calls[0].arguments);
+    }
+    assert_incremental_clean("K3 stopped tool streams cleanly", auto_tool_params, stopped_tool_output);
+
+    inputs.tool_choice = COMMON_CHAT_TOOL_CHOICE_REQUIRED;
+    const auto required_tool_params = common_chat_templates_apply(tmpls.get(), inputs);
+    t.assert_equal("K3 required tool grammar is eager", false, required_tool_params.grammar_lazy);
+    t.assert_equal("K3 required tool grammar exists", false, required_tool_params.grammar.empty());
+    if (!t.assert_equal("K3 required tool has one message stop", size_t(1),
+                        required_tool_params.additional_stops.size())) {
+        return;
+    }
+    t.assert_equal("K3 required tool keeps message stop", message_end,
+                   required_tool_params.additional_stops.front());
+    const auto required_tool = parse(required_tool_params, stopped_tool_output);
+    t.assert_equal("K3 required stopped tool count", size_t(1), required_tool.tool_calls.size());
 }
 
 // K3 emits tool calls as nested open/sep/close tags with the value as tag body,
