@@ -239,8 +239,6 @@ static const std::map<llm_kv, const char *> LLM_KV_NAMES = {
     { LLM_KV_SPLIT_TENSORS_COUNT,           "split.tensors.count" },
 
     { LLM_KV_EXPERT_LATENT_LENGTH,          "%s.expert_latent_length"      },
-    { LLM_KV_KDA_HEAD_DIM,                  "%s.kda.head_dim"              },
-    { LLM_KV_KDA_GATE_LOWER_BOUND,          "%s.kda.gate_lower_bound"      },
     { LLM_KV_ACTIVATION_SITU_BETA,          "%s.activation.situ_beta"        },
     { LLM_KV_ACTIVATION_SITU_LINEAR_BETA,   "%s.activation.situ_linear_beta" },
     { LLM_KV_ATTN_RES_BLOCK_SIZE,           "%s.attn_res.block_size"       },

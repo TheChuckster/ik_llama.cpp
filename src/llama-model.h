@@ -361,14 +361,8 @@ struct llama_layer {
     struct ggml_tensor * ssm_beta = nullptr;
     struct ggml_tensor * ssm_f_a = nullptr;
     struct ggml_tensor * ssm_g_a = nullptr;
-
-    // Kimi-K3 KDA: three separate short convolutions where Qwen3-Next fuses
-    // one, plus the low-rank gate projection f_a -> f_b whose H*K output is
-    // what makes the forget gate per-channel, and ssm_g, the output gate.
-    struct ggml_tensor * ssm_conv1d_q = nullptr;
-    struct ggml_tensor * ssm_conv1d_k = nullptr;
-    struct ggml_tensor * ssm_conv1d_v = nullptr;
-    struct ggml_tensor * ssm_f_a = nullptr;
+    // Kimi-K3 extends the shared KDA tensors with the second half of its
+    // low-rank full-rank-gate projection and a separate output gate.
     struct ggml_tensor * ssm_f_b = nullptr;
     struct ggml_tensor * ssm_g = nullptr;
 

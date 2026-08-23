@@ -226,8 +226,6 @@ enum llm_kv {
     // the experts actually live at is separate and narrower than the residual
     // stream, so it needs its own key.
     LLM_KV_EXPERT_LATENT_LENGTH,
-    LLM_KV_KDA_HEAD_DIM,
-    LLM_KV_KDA_GATE_LOWER_BOUND,
     LLM_KV_ACTIVATION_SITU_BETA,
     LLM_KV_ACTIVATION_SITU_LINEAR_BETA,
     LLM_KV_ATTN_RES_BLOCK_SIZE,
