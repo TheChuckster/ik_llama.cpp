@@ -100,7 +100,6 @@ struct llama_hparams {
     uint32_t n_expert_latent   = 0;      // width the routed experts live at (3584)
     uint32_t kda_head_dim      = 0;      // 128
     uint32_t attn_res_block_size = 0;    // 12
-    float    kda_gate_lower_bound = 0.0f;   // -5.0
     float    situ_beta            = 0.0f;   // 4.0
     float    situ_linear_beta     = 0.0f;   // 25.0
 

@@ -614,7 +614,6 @@ void llm_load_hparams(
 
                 ml.get_key(LLM_KV_EXPERT_LATENT_LENGTH,        hparams.n_expert_latent);
                 ml.get_key(LLM_KV_KDA_HEAD_DIM,                hparams.kda_head_dim);
-                ml.get_key(LLM_KV_KDA_HEAD_DIM,                hparams.kda_head_dim);
                 ml.get_key(LLM_KV_KDA_GATE_LOWER_BOUND,        hparams.kda_gate_lower_bound);
                 ml.get_key(LLM_KV_ACTIVATION_SITU_BETA,        hparams.situ_beta);
                 ml.get_key(LLM_KV_ACTIVATION_SITU_LINEAR_BETA, hparams.situ_linear_beta);
