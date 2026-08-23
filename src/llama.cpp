@@ -747,6 +747,14 @@ bool llama_context::update_cache_copies() {
     auto layer_has_attention_kv = [&](int il) {
         return !model.hparams.is_recurrent(il);
     };
+    auto layer_has_separate_v_cache = [&](int il) {
+        // Kimi-K3's non-recurrent layers use MLA: their persistent cache is the
+        // compressed [rope | latent-KV] row in k_l. build_kimi_k3 derives V
+        // from that row through wv_b, so the generic hybrid-cache allocator's
+        // v_l tensor is unused and intentionally has no graph copy to retarget.
+        return model.arch != LLM_ARCH_KIMI_K3 &&
+               !kv_self.v_l.empty() && kv_self.v_l[il] != nullptr;
+    };
 
     if ((int)kv_self.k_l.size() < n_layer) {
         printf("%s: kv_self.k_l.size() < n_layer\n", __func__);
@@ -765,8 +773,8 @@ bool llama_context::update_cache_copies() {
         if (kl) {
             GGML_ASSERT(model.split_mode == LLAMA_SPLIT_MODE_GRAPH || model.split_mode == LLAMA_SPLIT_MODE_ATTN);
             GGML_ASSERT(model.splits.size() > 1);
-            auto vl = !kv_self.v_l.empty() && kv_self.v_l[il] ? (ggml_split_tensor_t *)kv_self.v_l[il]->extra : nullptr;
-            GGML_ASSERT(kl && (kv_self.v_l.empty() || !kv_self.v_l[il] || vl));
+            auto vl = layer_has_separate_v_cache(il) ? (ggml_split_tensor_t *)kv_self.v_l[il]->extra : nullptr;
+            GGML_ASSERT(kl && (!layer_has_separate_v_cache(il) || vl));
             if (vl) {
                 GGML_ASSERT(kl->n_device == vl->n_device);
             }
@@ -801,7 +809,7 @@ bool llama_context::update_cache_copies() {
             c.cpy->view_offs = cache_head*c.step;
             c.cpy->src[1]->data = (char *)kv_self.k_l[il]->data + c.cpy->view_offs;
             c.cpy->data = c.cpy->src[1]->data;
-            if (!kv_self.v_l.empty() && kv_self.v_l[il]) {
+            if (layer_has_separate_v_cache(il)) {
                 auto& c = cache_copies[2*il+1];
                 if (!c.cpy || c.cpy->op != GGML_OP_CPY || c.cpy->view_src != kv_self.v_l[il]) {
                     printf("%s: V has no copy or is not a copy in layer %d\n", __func__, il);

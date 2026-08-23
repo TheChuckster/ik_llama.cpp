@@ -517,7 +517,15 @@ ggml_tensor * llm_build_context::build_kimi_k3_mla(ggml_cgraph * gf, ggml_tensor
     const size_t row_size = ggml_row_size(kv_self.k_l[il]->type, kv_lora_rank + n_embd_head_qk_rope);
     ggml_tensor * kv_cache_view = ggml_view_2d(ctx0, kv_self.k_l[il], kv_self.k_l[il]->ne[0], n_tokens,
             row_size, row_size * kv_head);
-    ggml_build_forward_expand(gf, ggml_cpy(ctx0, kvr, kv_cache_view));
+    // Register the cache write so graph reuse can retarget its baked view
+    // offset when kv_head advances. Without this, update_cache_copies() rejects
+    // every reused token graph at the first MLA layer and rebuilds it instead.
+    // K3 has only the compressed K-side cache; V is derived from the same rows.
+    GGML_ASSERT(2*il < (int64_t) lctx.cache_copies.size());
+    auto & cache_copy = lctx.cache_copies[2*il];
+    cache_copy.cpy  = ggml_cpy(ctx0, kvr, kv_cache_view);
+    cache_copy.step = row_size;
+    ggml_build_forward_expand(gf, cache_copy.cpy);
 
     ggml_tensor * kv_cache = ggml_view_2d(ctx0, kv_self.k_l[il],
             kv_lora_rank + n_embd_head_qk_rope, n_kv, row_size, 0);
