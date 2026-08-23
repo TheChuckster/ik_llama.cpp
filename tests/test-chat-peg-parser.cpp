@@ -23,6 +23,7 @@ static void test_prefix_tool_names(testing & t);
 static void test_tagged_peg_parser(testing & t);
 static void test_kimi_k3_parser(testing & t);
 static void test_kimi_k3_tool_parser(testing & t);
+static void test_kimi_k3_message_end_stop(testing & t);
 
 int main(int argc, char * argv[]) {
     testing t(std::cout);
@@ -43,6 +44,7 @@ int main(int argc, char * argv[]) {
     t.test("tagged peg parser", test_tagged_peg_parser);
     t.test("kimi k3", test_kimi_k3_parser);
     t.test("kimi k3 tools", test_kimi_k3_tool_parser);
+    t.test("kimi k3 message-end stop", test_kimi_k3_message_end_stop);
 
     return t.summary();
 }
@@ -1033,6 +1035,53 @@ static void test_kimi_k3_parser(testing & t) {
     t.assert_equal("k3 reasoning",
                    std::string("The user asks for the capital of Japan in one word. The answer is Tokyo."),
                    msg.reasoning_content);
+}
+
+static void test_kimi_k3_message_end_stop(testing & t) {
+    // Minimal K3-shaped template. The three XTML marker strings select the
+    // specialized K3 parser without requiring a model or its embedded template.
+    const std::string mock_template =
+        "{%- for message in messages -%}"
+        "{{- '<|open|>message role=\"' + message.role + '\"<|sep|>' + message.content + "
+        "'<|close|>message<|sep|><|end_of_msg|>' -}}"
+        "{%- endfor -%}"
+        "{%- if add_generation_prompt -%}"
+        "{{- '<|open|>message role=\"assistant\"<|sep|><|open|>think<|sep|>' -}}"
+        "{%- endif -%}";
+
+    auto tmpls = common_chat_templates_ptr(common_chat_templates_init(/* model= */ nullptr, mock_template));
+
+    common_chat_msg user;
+    user.role    = "user";
+    user.content = "hi";
+
+    common_chat_templates_inputs inputs;
+    inputs.messages         = { user };
+    inputs.enable_thinking  = true;
+    inputs.reasoning_format = COMMON_REASONING_FORMAT_DEEPSEEK;
+
+    const auto params = common_chat_templates_apply(tmpls.get(), inputs);
+    const std::string message_end = "<|close|>message<|sep|>";
+    if (!t.assert_equal("one K3 additional stop", size_t(1), params.additional_stops.size())) {
+        return;
+    }
+    if (!t.assert_equal("K3 stops at message closer", message_end, params.additional_stops.front())) {
+        return;
+    }
+
+    // llama-server removes a matched stop string before parsing. Verify that
+    // this deliberately absent trailer still yields clean reasoning and content.
+    common_peg_arena arena;
+    arena.load(params.parser);
+    common_chat_parser_params parser_params(params);
+    const auto parsed = common_chat_peg_parse(
+        arena,
+        "Keep this brief.<|close|>think<|sep|>"
+        "<|open|>response<|sep|>Hi there!<|close|>response<|sep|>",
+        /* is_partial= */ false,
+        parser_params);
+    t.assert_equal("K3 stopped reasoning", std::string("Keep this brief."), parsed.reasoning_content);
+    t.assert_equal("K3 stopped content", std::string("Hi there!"), parsed.content);
 }
 
 // K3 emits tool calls as nested open/sep/close tags with the value as tag body,
