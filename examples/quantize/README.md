@@ -37,6 +37,41 @@ Run the quantized model:
 ./llama-cli -m ./models/mymodel/ggml-model-Q4_K_M.gguf -n 128
 ```
 
+## Direction projection during quantization
+
+The quantizer can remove a normalized control-vector direction from selected
+residual-write tensors without editing the input GGUF. Projection happens in
+F32 immediately before the selected tensors are encoded:
+
+```bash
+./llama-quantize \
+    --allow-requantize \
+    --orthogonalize-control-vector ./direction.gguf \
+    --orthogonalize-layer-range 20 31 \
+    --orthogonalize-pattern '^token_embd\.weight$,^blk\.[0-9]+\.attn_output\.weight$' \
+    --orthogonalize-scale 1.0 \
+    --orthogonalize-expected-count 33 \
+    --orthogonalize-quant-passes 16 \
+    --orthogonalize-max-residual 0.02 \
+    ./model-input.gguf ./model-projected.gguf Q5_K
+```
+
+The layer range is inclusive and one-based. Each selected tensor must expose a
+residual axis matching the control vector. `--orthogonalize-expected-count`
+fails during preflight, before an output is opened, if the regex set changes.
+After quantization, `--orthogonalize-max-residual` decodes every selected
+tensor and limits the remaining direction component relative to its original
+source component; `0.02` means at most 2% retained. Q5 encoding can reintroduce
+more than that in a single pass. `--orthogonalize-quant-passes` permits bounded
+encode/decode correction passes: each retry subtracts a damped share of only the
+measured residue from the original projected F32 buffer, never from a lossy
+decoded buffer. For axis-0 embedding tensors, independently encoded rows keep
+their lowest-residual result across the bounded passes; axis-1 matrices keep the
+best whole-tensor pass because their measured columns cross quantization rows.
+More than one pass requires full (`1.0`) projection and an enabled residual
+limit. Use `--keep-pattern` for tensors that must be copied byte-for-byte. A
+tensor may not match both sets.
+
 When running the larger models, make sure you have enough disk space to store all the intermediate files.
 
 ## Memory/Disk Requirements

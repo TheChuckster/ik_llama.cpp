@@ -2952,9 +2952,14 @@ bool gpt_params_find_arg(int argc, char ** argv, const std::string & arg, gpt_pa
     if (arg == "--method") {
         CHECK_ARG
         std::string value(argv[i]);
-        /**/ if (value == "pca") { params.cvector_dimre_method = DIMRE_METHOD_PCA; }
-        else if (value == "mean") { params.cvector_dimre_method = DIMRE_METHOD_MEAN; }
+        /**/ if (value == "pca")       { params.cvector_dimre_method = DIMRE_METHOD_PCA; }
+        else if (value == "mean")      { params.cvector_dimre_method = DIMRE_METHOD_MEAN; }
+        else if (value == "mean-last") { params.cvector_dimre_method = DIMRE_METHOD_MEAN_LAST; }
         else { invalid_param = true; }
+        return true;
+    }
+    if (arg == "--apply-chat-template") {
+        params.cvector_apply_chat_template = true;
         return true;
     }
     if (arg == "--no-warmup") {
@@ -3488,7 +3493,9 @@ void gpt_params_print_usage(int /*argc*/, char ** argv, const gpt_params & param
     options.push_back({ "cvector",     "       --negative-file FNAME",  "negative prompts file, one prompt per line (default: '%s')", params.cvector_negative_file.c_str() });
     options.push_back({ "cvector",     "       --pca-batch N",          "batch size used for PCA. Larger batch runs faster, but uses more memory (default: %d)", params.n_pca_batch });
     options.push_back({ "cvector",     "       --pca-iter N",           "number of iterations used for PCA (default: %d)", params.n_pca_iterations });
-    options.push_back({ "cvector",     "       --method {pca,mean}",    "dimensionality reduction method to be used (default: pca)" });
+    options.push_back({ "cvector",     "       --method {pca,mean,mean-last}",
+                                                                        "dimensionality reduction method; mean-last uses only the final prompt token (default: pca)" });
+    options.push_back({ "cvector",     "       --apply-chat-template", "render each input line as a user message with the model's chat template before extracting activations" });
 
     options.push_back({ "export-lora" });
     options.push_back({ "export-lora", "-m,    --model",                "model path from which to load base model (default '%s')", params.model.c_str() });

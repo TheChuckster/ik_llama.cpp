@@ -152,7 +152,7 @@ static bool try_parse_ftype(const std::string & ftype_str_in, llama_ftype & ftyp
 //
 [[noreturn]]
 static void usage(const char * executable) {
-    printf("usage: %s [--help] [--allow-requantize] [--leave-output-tensor] [--pure] [--imatrix] [--hide-imatrix] [--ignore-imatrix-rules] [--dry-run] [--include-weights] [--exclude-weights] [--output-tensor-type] [--token-embedding-type] [--per-layer-token-embedding-type] [--extra-output-tensor] [--ffn-gate-inp-type] [--attn-q-type] [--attn-k-type] [--attn-v-type] [--attn-qkv-type] [--attn-output-type] [--ffn-gate-type] [--ffn-down-type] [--ffn-up-type] [--repack] [--repack-pattern] [--keep-pattern] [--keep-f32] [--keep-split] [--partial-requant] [--override-kv] model-f32.gguf [model-quant.gguf] type [nthreads]\n\n", executable);
+    printf("usage: %s [--help] [--allow-requantize] [--leave-output-tensor] [--pure] [--imatrix] [--hide-imatrix] [--ignore-imatrix-rules] [--dry-run] [--include-weights] [--exclude-weights] [--output-tensor-type] [--token-embedding-type] [--per-layer-token-embedding-type] [--extra-output-tensor] [--ffn-gate-inp-type] [--attn-q-type] [--attn-k-type] [--attn-v-type] [--attn-qkv-type] [--attn-output-type] [--ffn-gate-type] [--ffn-down-type] [--ffn-up-type] [--repack] [--repack-pattern] [--keep-pattern] [--keep-f32] [--keep-split] [--partial-requant] [--orthogonalize-control-vector] [--orthogonalize-layer-range] [--orthogonalize-pattern] [--orthogonalize-scale] [--orthogonalize-expected-count] [--orthogonalize-quant-passes] [--orthogonalize-max-residual] [--override-kv] model-f32.gguf [model-quant.gguf] type [nthreads]\n\n", executable);
     printf("  --allow-requantize: Allows requantizing tensors that have already been quantized. Warning: This can severely reduce quality compared to quantizing from 16bit or 32bit\n");
     printf("  --leave-output-tensor: Will leave output.weight un(re)quantized. Increases model size but may also increase quality, especially when requantizing\n");
     printf("  --pure: Disable k-quant mixtures and quantize all tensors to the same type\n");
@@ -175,6 +175,16 @@ static void usage(const char * executable) {
     printf("  --keep-pattern Comma separated list of regexs; matching tensors are COPIED VERBATIM, never (re)quantized.\n");
     printf("      Asking for a type a tensor already has still dequantizes and requantizes it, so this is the only way\n");
     printf("      to requantize part of a model - e.g. --keep-pattern '_exps\\.' to leave every routed expert untouched.\n\n");
+    printf("  --orthogonalize-control-vector FNAME: project a normalized band-average from this control-vector GGUF\n");
+    printf("      out of selected residual-write tensors immediately before quantization. The input model is never edited.\n");
+    printf("  --orthogonalize-layer-range START END: inclusive 1-based control-vector layer band to average.\n");
+    printf("  --orthogonalize-pattern REGEXS: comma-separated tensor-name regexes to project. Required with a vector.\n");
+    printf("  --orthogonalize-scale F: projection strength in (0, 1], default 1.0.\n");
+    printf("  --orthogonalize-expected-count N: fail before writing unless exactly N tensors match.\n\n");
+    printf("  --orthogonalize-quant-passes N: allow up to N encode/decode passes to compensate quantization residue.\n");
+    printf("      Includes the initial pass; range 1-16, default 1. Values above 1 require scale 1 and a residual limit.\n");
+    printf("  --orthogonalize-max-residual F: fail if quantization retains more than this fraction of the source direction component.\n");
+    printf("      For example, 0.02 permits at most 2%% of the original component. Disabled by default.\n\n");
     printf("  --symmetric-q40  Use [-7:7] range for Q4_0 quantization (turns off imatrix)\n\n");
     printf("  --slow-iq2ks Use the original very slow IQ2_KS quantization method.\n\n");
     printf("Additional specific tensor quantization types used in the custom quant scheme 'CQS (default is Q2_K):\n");
@@ -346,6 +356,80 @@ static bool parse_custom_quants(const std::string& arg, std::vector<CustomQ>& cu
     return true;
 }
 
+static std::vector<float> load_band_averaged_direction(
+        const std::string & fname,
+        int layer_start,
+        int layer_end) {
+    const auto cvec = llama_control_vector_load({ { 1.0f, fname } });
+    if (cvec.n_embd <= 0 || cvec.data.empty() || cvec.data.size() % cvec.n_embd != 0) {
+        throw std::runtime_error("invalid control-vector GGUF: " + fname);
+    }
+
+    const int n_layers = cvec.data.size() / cvec.n_embd;
+    if (layer_start <= 0) {
+        layer_start = 1;
+    }
+    if (layer_end <= 0) {
+        layer_end = n_layers;
+    }
+    if (layer_start > layer_end || layer_end > n_layers) {
+        throw std::runtime_error(format(
+                "control-vector layer range %d-%d is outside the available range 1-%d",
+                layer_start, layer_end, n_layers));
+    }
+
+    std::vector<float> result(cvec.n_embd, 0.0f);
+    std::vector<std::vector<float>> normalized_layers;
+    normalized_layers.reserve(layer_end - layer_start + 1);
+
+    // Normalize each layer before averaging. Otherwise a high-norm outlier can
+    // rotate the selected direction away from the stable layer band.
+    for (int il = layer_start; il <= layer_end; ++il) {
+        const float * src = cvec.data.data() + (il - 1) * cvec.n_embd;
+        double norm_sq = 0.0;
+        for (int i = 0; i < cvec.n_embd; ++i) {
+            norm_sq += double(src[i]) * src[i];
+        }
+        if (!(norm_sq > 0.0) || !std::isfinite(norm_sq)) {
+            throw std::runtime_error(format("control-vector layer %d has a zero or non-finite norm", il));
+        }
+        const float inv_norm = 1.0f / std::sqrt(norm_sq);
+        auto & normalized = normalized_layers.emplace_back(cvec.n_embd);
+        for (int i = 0; i < cvec.n_embd; ++i) {
+            normalized[i] = src[i] * inv_norm;
+            result[i] += normalized[i];
+        }
+    }
+
+    double result_norm_sq = 0.0;
+    for (float value : result) {
+        result_norm_sq += double(value) * value;
+    }
+    if (!(result_norm_sq > 0.0) || !std::isfinite(result_norm_sq)) {
+        throw std::runtime_error("the selected control-vector layer average has a zero or non-finite norm");
+    }
+    const float inv_result_norm = 1.0f / std::sqrt(result_norm_sq);
+    for (float & value : result) {
+        value *= inv_result_norm;
+    }
+
+    std::vector<float> cosines;
+    cosines.reserve(normalized_layers.size());
+    for (const auto & layer : normalized_layers) {
+        double cosine = 0.0;
+        for (int i = 0; i < cvec.n_embd; ++i) {
+            cosine += double(layer[i]) * result[i];
+        }
+        cosines.push_back(cosine);
+    }
+    std::sort(cosines.begin(), cosines.end());
+    printf("orthogonalize: loaded %d-dimensional direction from layers %d-%d; cosine to band mean min/median/max %.6f/%.6f/%.6f\n",
+            cvec.n_embd, layer_start, layer_end,
+            cosines.front(), cosines[cosines.size()/2], cosines.back());
+
+    return result;
+}
+
 int main(int argc, char ** argv) {
     if (argc < 3) {
         usage(argv[0]);
@@ -363,6 +447,11 @@ int main(int argc, char ** argv) {
 
     std::vector<std::string> repack_patterns;
     std::vector<std::string> keep_patterns;
+    std::vector<std::string> orthogonalize_patterns;
+    std::vector<float> orthogonalize_direction;
+    std::string orthogonalize_control_vector;
+    int orthogonalize_layer_start = -1;
+    int orthogonalize_layer_end = -1;
 
     bool hide_imatrix = false;
 
@@ -392,6 +481,50 @@ int main(int argc, char ** argv) {
             if (arg_idx < argc-1) {
                 auto p = string_split(argv[++arg_idx], ',');
                 keep_patterns.insert(keep_patterns.end(), p.begin(), p.end());
+            } else {
+                usage(argv[0]);
+            }
+        } else if (strcmp(argv[arg_idx], "--orthogonalize-control-vector") == 0) {
+            if (arg_idx < argc-1) {
+                orthogonalize_control_vector = argv[++arg_idx];
+            } else {
+                usage(argv[0]);
+            }
+        } else if (strcmp(argv[arg_idx], "--orthogonalize-layer-range") == 0) {
+            if (arg_idx < argc-2) {
+                orthogonalize_layer_start = std::stoi(argv[++arg_idx]);
+                orthogonalize_layer_end = std::stoi(argv[++arg_idx]);
+            } else {
+                usage(argv[0]);
+            }
+        } else if (strcmp(argv[arg_idx], "--orthogonalize-pattern") == 0) {
+            if (arg_idx < argc-1) {
+                auto p = string_split(argv[++arg_idx], ',');
+                orthogonalize_patterns.insert(orthogonalize_patterns.end(), p.begin(), p.end());
+            } else {
+                usage(argv[0]);
+            }
+        } else if (strcmp(argv[arg_idx], "--orthogonalize-scale") == 0) {
+            if (arg_idx < argc-1) {
+                params.orthogonalize_scale = std::stof(argv[++arg_idx]);
+            } else {
+                usage(argv[0]);
+            }
+        } else if (strcmp(argv[arg_idx], "--orthogonalize-expected-count") == 0) {
+            if (arg_idx < argc-1) {
+                params.orthogonalize_expected_count = std::stoi(argv[++arg_idx]);
+            } else {
+                usage(argv[0]);
+            }
+        } else if (strcmp(argv[arg_idx], "--orthogonalize-quant-passes") == 0) {
+            if (arg_idx < argc-1) {
+                params.orthogonalize_quant_passes = std::stoi(argv[++arg_idx]);
+            } else {
+                usage(argv[0]);
+            }
+        } else if (strcmp(argv[arg_idx], "--orthogonalize-max-residual") == 0) {
+            if (arg_idx < argc-1) {
+                params.orthogonalize_max_residual = std::stof(argv[++arg_idx]);
             } else {
                 usage(argv[0]);
             }
@@ -519,6 +652,42 @@ int main(int argc, char ** argv) {
     }
     if (!repack_patterns.empty()) {
         params.repack_pattern = &repack_patterns;
+    }
+    if (!orthogonalize_control_vector.empty()) {
+        if (orthogonalize_patterns.empty()) {
+            fprintf(stderr, "--orthogonalize-control-vector requires --orthogonalize-pattern\n");
+            return 1;
+        }
+        if (!std::isfinite(params.orthogonalize_scale) || params.orthogonalize_scale <= 0.0f || params.orthogonalize_scale > 1.0f) {
+            fprintf(stderr, "--orthogonalize-scale must be finite and in (0, 1]\n");
+            return 1;
+        }
+        if (!std::isfinite(params.orthogonalize_max_residual) || params.orthogonalize_max_residual > 1.0f) {
+            fprintf(stderr, "--orthogonalize-max-residual must be finite and <= 1\n");
+            return 1;
+        }
+        if (params.orthogonalize_quant_passes < 1 || params.orthogonalize_quant_passes > 16) {
+            fprintf(stderr, "--orthogonalize-quant-passes must be in [1, 16]\n");
+            return 1;
+        }
+        if (params.orthogonalize_quant_passes > 1 && params.orthogonalize_max_residual < 0.0f) {
+            fprintf(stderr, "--orthogonalize-quant-passes above 1 requires --orthogonalize-max-residual\n");
+            return 1;
+        }
+        if (params.orthogonalize_quant_passes > 1 && params.orthogonalize_scale != 1.0f) {
+            fprintf(stderr, "--orthogonalize-quant-passes above 1 requires --orthogonalize-scale 1\n");
+            return 1;
+        }
+        orthogonalize_direction = load_band_averaged_direction(
+                orthogonalize_control_vector, orthogonalize_layer_start, orthogonalize_layer_end);
+        params.orthogonalize_direction = &orthogonalize_direction;
+        params.orthogonalize_pattern = &orthogonalize_patterns;
+    } else if (!orthogonalize_patterns.empty() || params.orthogonalize_expected_count > 0 ||
+               params.orthogonalize_quant_passes != 1 ||
+               params.orthogonalize_max_residual >= 0.0f ||
+               orthogonalize_layer_start > 0 || orthogonalize_layer_end > 0) {
+        fprintf(stderr, "orthogonalization options require --orthogonalize-control-vector\n");
+        return 1;
     }
 
     if (argc - arg_idx < 2) {

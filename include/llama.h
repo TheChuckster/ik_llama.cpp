@@ -552,6 +552,12 @@ extern "C" {
         void * custom_quants;                // pointer to vector containing custom quantization rules
         void * repack_pattern;               // pointer to a vector containing regexes to be used for matching tensor names. Can be null
         void * keep_pattern;                 // regexes for tensors to COPY VERBATIM, never (re)quantize. Can be null
+        void * orthogonalize_direction;       // pointer to a normalized vector<float> to project out while quantizing. Can be null
+        void * orthogonalize_pattern;         // regexes selecting tensors whose residual-write axis is projected. Can be null
+        float orthogonalize_scale;            // 1.0 removes the selected direction completely
+        int32_t orthogonalize_expected_count; // fail before writing unless exactly this many tensors match; <= 0 disables the count check
+        int32_t orthogonalize_quant_passes;    // maximum encode/decode correction passes, including the first; must be >= 1
+        float orthogonalize_max_residual;     // maximum post-quant component retained relative to its source magnitude; < 0 disables the check
         struct quantize_user_data * user_data; // so we can pass extra data to the quantization functions
     } llama_model_quantize_params;
 
