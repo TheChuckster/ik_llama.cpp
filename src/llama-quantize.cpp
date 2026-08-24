@@ -2,6 +2,7 @@
 #include "llama-model.h"
 #include "llama-model-loader.h"
 #include "llama-quantize.h"
+#include "llama-direction-projection.h"
 
 #include "ggml.h"
 #include "ggml-common.h"
@@ -13,6 +14,10 @@
 #include <mutex>
 #include <fstream>
 #include <filesystem>
+#include <algorithm>
+#include <cmath>
+#include <limits>
+#include <unordered_map>
 
 //
 // quantization
@@ -1228,6 +1233,110 @@ static void llama_model_quantize_internal(const std::string & fname_inp, const s
     const std::vector<std::string> * keep_pattern = nullptr;
     if (params->keep_pattern) keep_pattern = (const std::vector<std::string> *)params->keep_pattern;
 
+    const std::vector<float> * orthogonalize_direction = nullptr;
+    const std::vector<std::string> * orthogonalize_pattern = nullptr;
+    std::unordered_map<std::string, int> orthogonalize_axes;
+    size_t orthogonalize_f32_count = 0;
+    if (params->orthogonalize_direction || params->orthogonalize_pattern) {
+        if (!params->orthogonalize_direction || !params->orthogonalize_pattern) {
+            throw std::runtime_error("orthogonalize_direction and orthogonalize_pattern must be supplied together");
+        }
+        if (params->only_copy || params->only_repack) {
+            throw std::runtime_error("direction orthogonalization cannot be combined with copy-only or repack-only mode");
+        }
+        if (!std::isfinite(params->orthogonalize_scale) ||
+                params->orthogonalize_scale <= 0.0f || params->orthogonalize_scale > 1.0f) {
+            throw std::runtime_error("orthogonalize_scale must be finite and in (0, 1]");
+        }
+        if (!std::isfinite(params->orthogonalize_max_residual) ||
+                params->orthogonalize_max_residual > 1.0f) {
+            throw std::runtime_error("orthogonalize_max_residual must be finite and <= 1");
+        }
+        if (params->orthogonalize_quant_passes < 1 || params->orthogonalize_quant_passes > 16) {
+            throw std::runtime_error("orthogonalize_quant_passes must be in [1, 16]");
+        }
+        if (params->orthogonalize_quant_passes > 1 && params->orthogonalize_max_residual < 0.0f) {
+            throw std::runtime_error("orthogonalize_quant_passes above 1 requires a residual limit");
+        }
+        if (params->orthogonalize_quant_passes > 1 && params->orthogonalize_scale != 1.0f) {
+            throw std::runtime_error("orthogonalize_quant_passes above 1 requires full projection (scale 1)");
+        }
+        orthogonalize_direction = (const std::vector<float> *) params->orthogonalize_direction;
+        orthogonalize_pattern = (const std::vector<std::string> *) params->orthogonalize_pattern;
+        if (orthogonalize_direction->size() != model.hparams.n_embd) {
+            throw std::runtime_error(format(
+                    "orthogonalization direction has %zu elements, model residual width is %u",
+                    orthogonalize_direction->size(), model.hparams.n_embd));
+        }
+        double direction_norm_sq = 0.0;
+        for (float value : *orthogonalize_direction) {
+            if (!std::isfinite(value)) {
+                throw std::runtime_error("orthogonalization direction contains a non-finite value");
+            }
+            direction_norm_sq += double(value) * value;
+        }
+        if (std::abs(direction_norm_sq - 1.0) > 1e-3) {
+            throw std::runtime_error(format(
+                    "orthogonalization direction must be normalized (squared norm is %.9f)", direction_norm_sq));
+        }
+
+        std::vector<std::regex> patterns;
+        patterns.reserve(orthogonalize_pattern->size());
+        for (const auto & value : *orthogonalize_pattern) {
+            patterns.emplace_back(value);
+        }
+        for (int i = 0; i < ml.n_tensors; ++i) {
+            const ggml_tensor * meta = ml.get_tensor_meta(i);
+            const std::string name = ggml_get_name(meta);
+            bool selected = false;
+            for (const auto & pattern : patterns) {
+                if (std::regex_search(name, pattern)) {
+                    selected = true;
+                    break;
+                }
+            }
+            if (!selected) {
+                continue;
+            }
+            if (keep_pattern) {
+                for (const auto & value : *keep_pattern) {
+                    if (std::regex_search(name, std::regex(value))) {
+                        throw std::runtime_error("tensor " + name + " matches both --keep-pattern and --orthogonalize-pattern");
+                    }
+                }
+            }
+            if (ggml_n_dims(meta) < 2 || ggml_n_dims(meta) > 4) {
+                throw std::runtime_error("selected tensor " + name + " is not a matrix");
+            }
+            const bool is_token_embedding = name == "token_embd.weight";
+            const int axis = is_token_embedding ? 0 : 1;
+            const int64_t axis_size = meta->ne[axis];
+            if (axis_size != (int64_t) orthogonalize_direction->size()) {
+                throw std::runtime_error(format(
+                        "selected tensor %s has size %lld on residual axis %d, expected %zu",
+                        name.c_str(), (long long) axis_size, axis, orthogonalize_direction->size()));
+            }
+            orthogonalize_axes.emplace(name, axis);
+            orthogonalize_f32_count += meta->type == GGML_TYPE_F32;
+        }
+        if (orthogonalize_axes.empty()) {
+            throw std::runtime_error("orthogonalization patterns did not match any tensors");
+        }
+        if (params->orthogonalize_expected_count > 0 &&
+                (int) orthogonalize_axes.size() != params->orthogonalize_expected_count) {
+            throw std::runtime_error(format(
+                    "orthogonalization matched %zu tensors, expected exactly %d",
+                    orthogonalize_axes.size(), params->orthogonalize_expected_count));
+        }
+        LLAMA_LOG_INFO("%s: orthogonalization preflight matched %zu tensors; selected-F32=%zu; scale %.4f; quant-passes %d; input files remain read-only\n",
+                __func__, orthogonalize_axes.size(), orthogonalize_f32_count,
+                params->orthogonalize_scale, params->orthogonalize_quant_passes);
+    } else if (params->orthogonalize_expected_count > 0 ||
+            params->orthogonalize_quant_passes != 1 ||
+            params->orthogonalize_max_residual >= 0.0f) {
+        throw std::runtime_error("orthogonalization controls require a direction and pattern");
+    }
+
     for (int i = 0; i < ml.n_tensors; ++i) {
         const struct ggml_tensor * meta = ml.get_tensor_meta(i);
 
@@ -1312,7 +1421,11 @@ static void llama_model_quantize_internal(const std::string & fname_inp, const s
 
     std::vector<no_init<uint8_t>> read_data;
     std::vector<no_init<uint8_t>> work;
+    std::vector<no_init<uint8_t>> best_quant_buf;
     std::vector<no_init<float>> f32_conv_buf;
+    std::vector<no_init<float>> post_quant_buf;
+    std::vector<double> orthogonalization_component_ratios;
+    std::vector<double> orthogonalization_post_quant_ratios;
 
     uint16_t n_split = 1;
     // Assume split index is continuous
@@ -1446,6 +1559,9 @@ static void llama_model_quantize_internal(const std::string & fname_inp, const s
         }
 
         std::string name = ggml_get_name(tensor);
+        const auto orthogonalize_it = orthogonalize_axes.find(name);
+        const bool needs_orthogonalization = orthogonalize_it != orthogonalize_axes.end();
+        llama_direction_projection_stats orthogonalization_source_stats;
 
         if (!ml.use_mmap) {
             if (read_data.size() < ggml_nbytes(tensor)) {
@@ -1485,7 +1601,7 @@ static void llama_model_quantize_internal(const std::string & fname_inp, const s
         // uniformly tiny, so quantizing them buys nothing and can break the
         // model or quietly degrade it. Only meaningful when requantizing; on a
         // real F32 source model this would quantize nothing, hence opt-in.
-        if (params->keep_f32 && tensor->type == GGML_TYPE_F32) {
+        if (params->keep_f32 && tensor->type == GGML_TYPE_F32 && !needs_orthogonalization) {
             quantize = false;
         }
 
@@ -1660,6 +1776,15 @@ static void llama_model_quantize_internal(const std::string & fname_inp, const s
             if (tensor != output_tensor) {
                 quantize &= tensor->type != new_type;
             }
+            // A same-type conversion is normally skipped, but a selected
+            // tensor must still be decoded, projected, and encoded again.
+            if (needs_orthogonalization) {
+                quantize = true;
+            }
+        }
+
+        if (needs_orthogonalization && !quantize) {
+            throw std::runtime_error("selected tensor " + name + " is not eligible for quantization/projection");
         }
 
         if (!quantize) {
@@ -1767,12 +1892,39 @@ static void llama_model_quantize_internal(const std::string & fname_inp, const s
                 float * f32_data;
 
                 if (tensor->type == GGML_TYPE_F32) {
-                    f32_data = (float *) tensor->data;
+                    if (needs_orthogonalization) {
+                        if (f32_conv_buf.size() < (size_t) nelements) {
+                            f32_conv_buf.resize(nelements);
+                        }
+                        std::memcpy(f32_conv_buf.data(), tensor->data, nelements * sizeof(float));
+                        f32_data = (float *) f32_conv_buf.data();
+                    } else {
+                        f32_data = (float *) tensor->data;
+                    }
                 } else if (ggml_is_quantized(tensor->type) && !params->allow_requantize) {
                     throw std::runtime_error(format("requantizing from type %s is disabled", ggml_type_name(tensor->type)));
                 } else {
                     llama_tensor_dequantize_internal(tensor, f32_conv_buf, workers, nelements, nthread);
                     f32_data = (float *) f32_conv_buf.data();
+                }
+
+                if (needs_orthogonalization) {
+                    const auto stats = llama_direction_orthogonalize_f32(
+                            f32_data, tensor, *orthogonalize_direction,
+                            params->orthogonalize_scale, orthogonalize_it->second, nthread);
+                    if (!(stats.component_norm_sq > 0.0) || !std::isfinite(stats.component_norm_sq) ||
+                            !(stats.tensor_norm_sq > 0.0) || !std::isfinite(stats.tensor_norm_sq)) {
+                        throw std::runtime_error(
+                                "selected tensor " + name + " has invalid source projection statistics");
+                    }
+                    orthogonalization_source_stats = stats;
+                    const double ratio = stats.tensor_norm_sq > 0.0
+                            ? std::sqrt(stats.component_norm_sq / stats.tensor_norm_sq)
+                            : 0.0;
+                    orthogonalization_component_ratios.push_back(ratio);
+                    LLAMA_LOG_INFO("orthogonalize: %s residual-axis=%d source-component=%.6f%% float-residual=%.6f%%\n",
+                            name.c_str(), orthogonalize_it->second, 100.0 * ratio,
+                            100.0 * ratio * std::abs(1.0f - params->orthogonalize_scale));
                 }
 
                 auto expected_size = ggml_row_size(new_type, tensor->ne[0])*tensor->ne[1]*tensor->ne[2]*tensor->ne[3];
@@ -1784,6 +1936,10 @@ static void llama_model_quantize_internal(const std::string & fname_inp, const s
                 new_data = work.data();
 
                 if (params->extra_output_type != GGML_TYPE_COUNT && tensor == output_tensor) {
+                    if (needs_orthogonalization) {
+                        throw std::runtime_error(
+                                "direction orthogonalization cannot target a duplicated extra output tensor");
+                    }
                     auto cur_size = ggml_nbytes(tensor);
                     if (new_type != tensor->type) {
                         do_quantize(nthread, tensor, new_type, f32_data, (char *)new_data, imatrix, workers,
@@ -1824,9 +1980,139 @@ static void llama_model_quantize_internal(const std::string & fname_inp, const s
                         new_size, 1, params);
 
                     name = extra.name;
-                } else {
+                } else if (!needs_orthogonalization) {
                     do_quantize(nthread, tensor, new_type, f32_data, (char *)new_data, imatrix, workers,
                             new_size, chunk_size_multiplier, params);
+                } else {
+                    // Quantization can reintroduce a direction component. Keep
+                    // the original projected F32 data in f32_conv_buf, decode
+                    // each candidate encoding into a separate buffer, and
+                    // subtract only that measured residue before retrying. This
+                    // avoids accumulating loss by requantizing a decoded quant.
+                    double best_retained_ratio = std::numeric_limits<double>::infinity();
+                    std::vector<double> best_component_magnitudes;
+                    for (int pass = 1; pass <= params->orthogonalize_quant_passes; ++pass) {
+                        new_size = 0;
+                        do_quantize(nthread, tensor, new_type, f32_data, (char *)new_data, imatrix, workers,
+                                new_size, chunk_size_multiplier, params);
+
+                        ggml_tensor quantized = *tensor;
+                        quantized.type = new_type;
+                        quantized.data = new_data;
+                        llama_tensor_dequantize_internal(
+                                &quantized, post_quant_buf, workers, nelements, nthread);
+                        std::vector<double> component_coefficients;
+                        // A damped step explores the discontinuous quantized
+                        // code space without the two-point oscillation caused
+                        // by subtracting the full decoded residue.
+                        const float correction_scale = pass < params->orthogonalize_quant_passes ? 0.25f : 0.0f;
+                        const auto post_stats = llama_direction_remove_measured_component_f32(
+                                f32_data, (const float *) post_quant_buf.data(), tensor,
+                                *orthogonalize_direction, correction_scale,
+                                orthogonalize_it->second, nthread,
+                                orthogonalize_it->second == 0 ? &component_coefficients : nullptr);
+                        if (!(post_stats.component_norm_sq >= 0.0) ||
+                                !std::isfinite(post_stats.component_norm_sq) ||
+                                !(post_stats.tensor_norm_sq >= 0.0) ||
+                                !std::isfinite(post_stats.tensor_norm_sq)) {
+                            throw std::runtime_error(
+                                    "selected tensor " + name + " has invalid post-quant projection statistics");
+                        }
+                        const double post_tensor_ratio = post_stats.tensor_norm_sq > 0.0
+                                ? std::sqrt(post_stats.component_norm_sq / post_stats.tensor_norm_sq)
+                                : 0.0;
+                        const double retained_ratio = llama_direction_retained_component_ratio(
+                                orthogonalization_source_stats, post_stats);
+                        if (!std::isfinite(retained_ratio) || !std::isfinite(post_tensor_ratio)) {
+                            throw std::runtime_error(
+                                    "selected tensor " + name + " has invalid post-quant projection ratios");
+                        }
+                        if (best_quant_buf.size() < new_size) {
+                            best_quant_buf.resize(new_size);
+                        }
+                        if (orthogonalize_it->second == 0) {
+                            // Embedding vectors are quantization rows. Keep the
+                            // best independently encoded row seen across passes;
+                            // combining those rows remains a valid tensor and is
+                            // strictly no worse than any whole-pass candidate.
+                            const size_t row_size = ggml_row_size(new_type, tensor->ne[0]);
+                            const int64_t n_rows = nelements / tensor->ne[0];
+                            GGML_ASSERT(component_coefficients.size() == (size_t) n_rows);
+                            GGML_ASSERT(row_size * n_rows == new_size);
+                            if (best_component_magnitudes.empty()) {
+                                best_component_magnitudes.resize(n_rows);
+                                std::memcpy(best_quant_buf.data(), new_data, new_size);
+                                for (int64_t row = 0; row < n_rows; ++row) {
+                                    best_component_magnitudes[row] = std::abs(component_coefficients[row]);
+                                }
+                            } else {
+                                for (int64_t row = 0; row < n_rows; ++row) {
+                                    const double magnitude = std::abs(component_coefficients[row]);
+                                    if (magnitude < best_component_magnitudes[row]) {
+                                        best_component_magnitudes[row] = magnitude;
+                                        std::memcpy(best_quant_buf.data() + row * row_size,
+                                                (const uint8_t *) new_data + row * row_size, row_size);
+                                    }
+                                }
+                            }
+                            double best_component_norm_sq = 0.0;
+                            for (double magnitude : best_component_magnitudes) {
+                                best_component_norm_sq += magnitude * magnitude;
+                            }
+                            best_retained_ratio = std::sqrt(
+                                    best_component_norm_sq / orthogonalization_source_stats.component_norm_sq);
+                        } else if (retained_ratio < best_retained_ratio) {
+                            // For axis 1, quantization rows and independently
+                            // measured residual columns are transverse, so only
+                            // whole-tensor candidates can be safely selected.
+                            best_retained_ratio = retained_ratio;
+                            std::memcpy(best_quant_buf.data(), new_data, new_size);
+                        }
+
+                        LLAMA_LOG_INFO("orthogonalize: %s quant-pass=%d/%d retained-source-component=%.6f%% best=%.6f%% absolute-component=%.6f%%\n",
+                                name.c_str(), pass, params->orthogonalize_quant_passes,
+                                100.0 * retained_ratio, 100.0 * best_retained_ratio,
+                                100.0 * post_tensor_ratio);
+
+                        if (params->orthogonalize_max_residual < 0.0f ||
+                                best_retained_ratio <= params->orthogonalize_max_residual) {
+                            break;
+                        }
+                        if (pass < params->orthogonalize_quant_passes) {
+                            LLAMA_LOG_INFO("orthogonalize: %s correcting measured quantization residue before pass %d\n",
+                                    name.c_str(), pass + 1);
+                        }
+                    }
+
+                    std::memcpy(new_data, best_quant_buf.data(), new_size);
+                    ggml_tensor best_quantized = *tensor;
+                    best_quantized.type = new_type;
+                    best_quantized.data = new_data;
+                    llama_tensor_dequantize_internal(
+                            &best_quantized, post_quant_buf, workers, nelements, nthread);
+                    const auto best_post_stats = llama_direction_orthogonalize_f32(
+                            (float *) post_quant_buf.data(), tensor, *orthogonalize_direction,
+                            0.0f, orthogonalize_it->second, nthread);
+                    const double post_tensor_ratio = best_post_stats.tensor_norm_sq > 0.0
+                            ? std::sqrt(best_post_stats.component_norm_sq / best_post_stats.tensor_norm_sq)
+                            : 0.0;
+                    const double retained_ratio = llama_direction_retained_component_ratio(
+                            orthogonalization_source_stats, best_post_stats);
+                    if (!std::isfinite(retained_ratio) || !std::isfinite(post_tensor_ratio)) {
+                        throw std::runtime_error(
+                                "selected tensor " + name + " has invalid best post-quant projection ratios");
+                    }
+                    if (params->orthogonalize_max_residual >= 0.0f &&
+                            retained_ratio > params->orthogonalize_max_residual) {
+                        throw std::runtime_error(format(
+                                "selected tensor %s retained %.6f%% of its source direction component after %d quantization pass(es), above limit %.6f%%",
+                                name.c_str(), 100.0 * retained_ratio,
+                                params->orthogonalize_quant_passes,
+                                100.0 * params->orthogonalize_max_residual));
+                    }
+                    orthogonalization_post_quant_ratios.push_back(retained_ratio);
+                    LLAMA_LOG_INFO("orthogonalize: %s post-quant-residual=%.6f%% absolute-component=%.6f%%\n",
+                            name.c_str(), 100.0 * retained_ratio, 100.0 * post_tensor_ratio);
                 }
 
             }
@@ -1854,6 +2140,23 @@ QuantizationDone:;
 
     LLAMA_LOG_INFO("%s: model size  = %8.2f MB\n", __func__, total_size_org/1024.0/1024.0);
     LLAMA_LOG_INFO("%s: quant size  = %8.2f MB\n", __func__, total_size_new/1024.0/1024.0);
+
+    if (!orthogonalization_component_ratios.empty()) {
+        std::sort(orthogonalization_component_ratios.begin(), orthogonalization_component_ratios.end());
+        LLAMA_LOG_INFO("%s: orthogonalized %zu tensors; source component ratio min/median/max %.6f%%/%.6f%%/%.6f%%\n",
+                __func__, orthogonalization_component_ratios.size(),
+                100.0 * orthogonalization_component_ratios.front(),
+                100.0 * orthogonalization_component_ratios[orthogonalization_component_ratios.size()/2],
+                100.0 * orthogonalization_component_ratios.back());
+    }
+    if (!orthogonalization_post_quant_ratios.empty()) {
+        std::sort(orthogonalization_post_quant_ratios.begin(), orthogonalization_post_quant_ratios.end());
+        LLAMA_LOG_INFO("%s: post-quant retained source component min/median/max %.6f%%/%.6f%%/%.6f%%\n",
+                __func__,
+                100.0 * orthogonalization_post_quant_ratios.front(),
+                100.0 * orthogonalization_post_quant_ratios[orthogonalization_post_quant_ratios.size()/2],
+                100.0 * orthogonalization_post_quant_ratios.back());
+    }
 
     if (qs.n_fallback > 0) {
         LLAMA_LOG_WARN("%s: WARNING: %d of %d tensor(s) required fallback quantization\n",

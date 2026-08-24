@@ -1,4 +1,6 @@
 #include "common.h"
+#include "chat.h"
+#include "cvector-layer-capture.h"
 #include "llama.h"
 #include "ggml.h"
 #include "pca.hpp"
@@ -19,7 +21,6 @@
 #include <algorithm>
 #include <iostream>
 #include <fstream>
-#include <climits>
 
 
 //////////////////////////////////////////////////
@@ -43,6 +44,7 @@ static void print_usage(int argc, char ** argv, const gpt_params & params) {
     printf("\n    with GPU:   %s -m ./llama-3.Q4_K_M.gguf -ngl 99\n", argv[0]);
     printf("\n    advanced:   %s -m ./llama-3.Q4_K_M.gguf -ngl 99 --pca-iter 2000 --pca-batch 100\n", argv[0]);
     printf("\n    using mean: %s -m ./llama-3.Q4_K_M.gguf --method mean\n", argv[0]);
+    printf("\n    refusal direction: %s -m ./model.gguf --method mean-last --apply-chat-template --jinja\n", argv[0]);
     printf("\n");
 }
 
@@ -56,6 +58,7 @@ struct callback_data {
     int n_layers = 0;
     int n_tokens = 0;
     bool is_eval_pos = true;
+    bool last_token_only = false;
 
     // each element of the vector correspond to one layer
     std::vector<struct ggml_tensor *> v_pos; // vector of matrices of size [n_embd, n_tokens]
@@ -76,11 +79,16 @@ struct callback_data {
             ctx_ggml = ggml_init(params_ggml);
         }
 
-        // copy tensor data
-        auto n_bytes = ggml_nbytes(t);
-        struct ggml_tensor * t_layer = ggml_new_tensor_2d(ctx_ggml, t->type, t->ne[0], t->ne[1]);
+        // In mean-last mode, copy only the final prompt position. This matches
+        // the difference-in-means extraction used by Arditi et al., avoids
+        // learning lexical differences across the whole instruction, and keeps
+        // memory bounded for very large models.
+        const int64_t n_rows = last_token_only ? 1 : t->ne[1];
+        const size_t n_bytes = t->ne[0] * n_rows * sizeof(float);
+        struct ggml_tensor * t_layer = ggml_new_tensor_2d(ctx_ggml, t->type, t->ne[0], n_rows);
         t_layer->data = malloc(n_bytes); // TODO @ngxson : get rid of this malloc somehow
-        ggml_backend_tensor_get(t, t_layer->data, 0, n_bytes);
+        const size_t offset = last_token_only ? (t->ne[1] - 1) * t->nb[1] : 0;
+        ggml_backend_tensor_get(t, t_layer->data, offset, n_bytes);
         ggml_set_name(t_layer, ggml_get_name(t));
         //print_debug_tensor(t_layer);
 
@@ -95,7 +103,7 @@ struct callback_data {
     // all zero rows in the diff tensor will also be removed
     // NOTE: final layer is ignored. we only have (n_layers - 1) to process
     std::vector<struct ggml_tensor *> calc_diff() {
-        for (float il = 0; il < v_pos.size(); il++) {
+        for (size_t il = 0; il < v_pos.size(); ++il) {
             float * a = (float *) v_pos[il]->data;
             float * b = (float *) v_neg[il]->data;
             size_t n_elem = ggml_nelements(v_pos[il]);
@@ -116,7 +124,7 @@ struct callback_data {
             // check if given row containing all zero elements
             int n_cols = t->ne[0]; // hint: should be equal to n_embd
             for (int col = 0; col < n_cols; ++col) {
-                if (ggml_get_f32_nd(t, col, row, 0, 0) > eps) {
+                if (std::abs(ggml_get_f32_nd(t, col, row, 0, 0)) > eps) {
                     return false;
                 }
             }
@@ -270,13 +278,15 @@ struct tokenized_prompt {
     std::vector<llama_token> tokens_neg;
     size_t max_seq_len;
 
-    tokenized_prompt(llama_context * ctx, std::string pos, std::string neg) {
+    tokenized_prompt(llama_context * ctx, std::string pos, std::string neg, bool pad_to_equal) {
         const bool add_bos = llama_should_add_bos_token(llama_get_model(ctx));
         tokens_pos = ::common_tokenize(ctx, pos, add_bos, true);
         tokens_neg = ::common_tokenize(ctx, neg, add_bos, true);
         max_seq_len = std::max(tokens_pos.size(), tokens_neg.size());
-        padding_seq(ctx, tokens_pos, max_seq_len);
-        padding_seq(ctx, tokens_neg, max_seq_len);
+        if (pad_to_equal) {
+            padding_seq(ctx, tokens_pos, max_seq_len);
+            padding_seq(ctx, tokens_neg, max_seq_len);
+        }
     }
 
     void padding_seq(llama_context * ctx, std::vector<llama_token> & tokens, size_t len) {
@@ -321,14 +331,19 @@ static std::vector<std::string> ctrlvec_load_prompt_file(std::string path, bool 
 
 static int cb_eval(struct ggml_tensor * t, bool ask, void * user_data) {
     auto * cb_data = (callback_data *) user_data;
-    static const char * l_out_name = "l_out";
-    const bool is_l_out = strncmp(t->name, l_out_name, strlen(l_out_name)) == 0;
+    // The control-vector format intentionally omits the final transformer
+    // layer. Most graph builders narrow that layer to requested output rows,
+    // which made the old shape check skip it implicitly. K3 correctly delays
+    // narrowing until after its final AttnRes mix, so l_out-(n_layer-1) remains
+    // full-width. Filter by the exact layer name instead of relying on shape,
+    // and reject similarly prefixed nodes such as l_out_selected.
+    const bool is_cvector_layer = cvector_should_capture_layer(t->name, cb_data->n_layers);
 
     if (ask) {
-        return is_l_out ? 1 : 0;
+        return is_cvector_layer ? 1 : 0;
     }
 
-    if (!is_l_out || t->ne[1] != cb_data->n_tokens) {
+    if (!is_cvector_layer || t->ne[1] != cb_data->n_tokens) {
         return 1;
     }
 
@@ -395,8 +410,12 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
-    if (params.n_pca_iterations % params.n_pca_batch != 0) {
+    if (params.cvector_dimre_method == DIMRE_METHOD_PCA && params.n_pca_iterations % params.n_pca_batch != 0) {
         fprintf(stderr, "PCA iterations must by multiply of PCA batch size\n");
+        return 1;
+    }
+    if (params.cvector_apply_chat_template && !params.use_jinja) {
+        fprintf(stderr, "--apply-chat-template requires --jinja so the embedded model template is used exactly\n");
         return 1;
     }
 
@@ -430,24 +449,56 @@ int main(int argc, char ** argv) {
     train_context ctx_train(n_embd, n_layers);
 
     // load and prepare entries for training
-    prepare_entries(params, ctx_train);
+    if (prepare_entries(params, ctx_train) != 0) {
+        llama_free(ctx);
+        llama_free_model(model);
+        llama_backend_free();
+        return 1;
+    }
+
+    if (params.cvector_apply_chat_template) {
+        auto chat_templates = common_chat_templates_init(model, params.chat_template);
+        const bool template_supports_thinking =
+                common_chat_templates_support_enable_thinking(chat_templates.get());
+        auto render_user_message = [&](const std::string & instruction) {
+            common_chat_templates_inputs inputs;
+            inputs.messages.push_back({ "user", instruction });
+            inputs.add_generation_prompt = true;
+            inputs.use_jinja = true;
+            inputs.reasoning_format = params.reasoning_format;
+            // Match the server's auto/default reasoning decision exactly.
+            inputs.enable_thinking = params.enable_reasoning != 0 && template_supports_thinking;
+            inputs.chat_template_kwargs = params.default_template_kwargs;
+            return common_chat_templates_apply(chat_templates.get(), inputs).prompt;
+        };
+        for (auto & prompt : ctx_train.positive_entries) {
+            prompt = render_user_message(prompt);
+        }
+        for (auto & prompt : ctx_train.negative_entries) {
+            prompt = render_user_message(prompt);
+        }
+    }
+
+    const bool mean_last = params.cvector_dimre_method == DIMRE_METHOD_MEAN_LAST;
+    cb_data.last_token_only = mean_last;
 
     // we have to pretokenize everything because otherwise we don't know how much overhead to allocate ctx_diffs_wrapped
     std::vector<tokenized_prompt> tokenized_prompts;
     size_t n_total_tokens = 0;
     for (size_t i = 0; i < ctx_train.positive_entries.size(); ++i) {
-        tokenized_prompt t(ctx, ctx_train.positive_entries[i], ctx_train.negative_entries[i]);
-        n_total_tokens += 2 * t.max_seq_len;
+        tokenized_prompt t(ctx, ctx_train.positive_entries[i], ctx_train.negative_entries[i], !mean_last);
+        n_total_tokens += mean_last ? t.tokens_pos.size() + t.tokens_neg.size() : 2 * t.max_seq_len;
         tokenized_prompts.push_back(std::move(t));
     }
 
     std::cout << "n_total_tokens: " << n_total_tokens << std::endl;
 
+    bool evaluation_ok = true;
     for(size_t i = 0; i < ctx_train.positive_entries.size(); ++i) {
         bool success = false;
         tokenized_prompt t = tokenized_prompts[i];
         cb_data.n_layers = n_layers;
-        cb_data.n_tokens = t.max_seq_len;
+        cb_data.n_tokens = mean_last ? t.tokens_pos.size() : t.max_seq_len;
 
         printf("Evaluating prompt[%d/%d]: \"%s\" - \"%s\" (%d tokens)\n",
             (int) i+1, (int) ctx_train.positive_entries.size(),
@@ -457,11 +508,27 @@ int main(int argc, char ** argv) {
 
         cb_data.is_eval_pos = true;
         success = get_hidden_layers(ctx, t.tokens_pos);
-        if (!success) break;
+        if (!success) {
+            evaluation_ok = false;
+            break;
+        }
 
         cb_data.is_eval_pos = false;
+        cb_data.n_tokens = mean_last ? t.tokens_neg.size() : t.max_seq_len;
         success = get_hidden_layers(ctx, t.tokens_neg);
-        if (!success) break;
+        if (!success) {
+            evaluation_ok = false;
+            break;
+        }
+
+        const size_t expected_layers = static_cast<size_t>(n_layers - 1);
+        if (cb_data.v_pos.size() != expected_layers || cb_data.v_neg.size() != expected_layers) {
+            fprintf(stderr,
+                    "%s: expected %zu captured layers, got %zu positive and %zu negative\n",
+                    __func__, expected_layers, cb_data.v_pos.size(), cb_data.v_neg.size());
+            evaluation_ok = false;
+            break;
+        }
 
         // calculate diff and remove all zero rows
         auto v_diff_filtered = cb_data.calc_diff();
@@ -477,6 +544,11 @@ int main(int argc, char ** argv) {
     printf("Done evaluate prompts, unload model...\n");
     llama_free(ctx);
     llama_free_model(model);
+
+    if (!evaluation_ok) {
+        llama_backend_free();
+        return 1;
+    }
 
     bool use_pca = params.cvector_dimre_method == DIMRE_METHOD_PCA;
 

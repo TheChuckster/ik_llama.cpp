@@ -217,6 +217,17 @@ foreach(HD 8 64 128)
     set_property(TEST test-delta-net-gate-${HD} PROPERTY LABELS main)
 endforeach()
 
+add_executable(test-direction-projection test-direction-projection.cpp)
+target_include_directories(test-direction-projection PRIVATE ${PROJECT_SOURCE_DIR}/src)
+target_link_libraries(test-direction-projection PRIVATE ggml)
+add_test(NAME test-direction-projection COMMAND $<TARGET_FILE:test-direction-projection>)
+set_property(TEST test-direction-projection PROPERTY LABELS main)
+
+add_executable(test-cvector-layer-capture test-cvector-layer-capture.cpp)
+target_include_directories(test-cvector-layer-capture PRIVATE ${PROJECT_SOURCE_DIR}/examples/cvector-generator)
+add_test(NAME test-cvector-layer-capture COMMAND $<TARGET_FILE:test-cvector-layer-capture>)
+set_property(TEST test-cvector-layer-capture PROPERTY LABELS main)
+
 # llama_target_and_test(test-opt.cpp) # SLOW
 
 llama_target_and_test(test-model-load-cancel.cpp  LABEL "model")
@@ -227,4 +238,3 @@ llama_target_and_test(test-autorelease.cpp        LABEL "model")
 get_filename_component(TEST_TARGET test-c.c NAME_WE)
 add_executable(${TEST_TARGET} test-c.c)
 target_link_libraries(${TEST_TARGET} PRIVATE llama)
-

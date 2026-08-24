@@ -111,6 +111,7 @@ enum llama_example {
 enum dimre_method {
     DIMRE_METHOD_PCA,
     DIMRE_METHOD_MEAN,
+    DIMRE_METHOD_MEAN_LAST,
 };
 
 // reasoning API response format (not to be confused as chat template's reasoning format)
@@ -594,6 +595,7 @@ struct gpt_params {
     int n_pca_batch = 100;
     int n_pca_iterations = 1000;
     dimre_method cvector_dimre_method = DIMRE_METHOD_PCA;
+    bool cvector_apply_chat_template  = false;
     std::string cvector_outfile       = "control_vector.gguf";
     std::string cvector_positive_file = "examples/cvector-generator/positive.txt";
     std::string cvector_negative_file = "examples/cvector-generator/negative.txt";

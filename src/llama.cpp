@@ -8013,6 +8013,12 @@ struct llama_model_quantize_params llama_model_quantize_default_params() {
         /*.custom_quants                  =*/ nullptr,
         /*.repack_pattern                 =*/ nullptr,
         /*.keep_pattern                   =*/ nullptr,
+        /*.orthogonalize_direction        =*/ nullptr,
+        /*.orthogonalize_pattern          =*/ nullptr,
+        /*.orthogonalize_scale            =*/ 1.0f,
+        /*.orthogonalize_expected_count   =*/ 0,
+        /*.orthogonalize_quant_passes      =*/ 1,
+        /*.orthogonalize_max_residual     =*/ -1.0f,
         /*.user_data                      =*/ nullptr,
     };
 
