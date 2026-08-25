@@ -1,4 +1,5 @@
 #include "llama-direction-projection.h"
+#include "llama-direction-subspace.h"
 
 #include <algorithm>
 #include <cmath>
@@ -263,6 +264,96 @@ static void test_quantization_residual_compensation() {
     CHECK(std::abs(linear_coefficients[2] - 10.0) < 1e-6);
 }
 
+static void test_subspace_projection() {
+    const std::vector<std::vector<float>> basis = {
+        { 1.0f, 0.0f, 0.0f },
+        { 0.0f, 1.0f, 0.0f },
+    };
+
+    auto embedding = tensor_2d(3, 2);
+    std::vector<float> axis0 = {
+        1.0f, 2.0f, 3.0f,
+        4.0f, 5.0f, 6.0f,
+    };
+    std::vector<double> magnitudes;
+    const auto axis0_stats = llama_direction_remove_measured_subspace_f32(
+            axis0.data(), axis0.data(), &embedding, basis, 1.0f, 0, 4, &magnitudes);
+    const std::vector<float> expected_axis0 = {
+        0.0f, 0.0f, 3.0f,
+        0.0f, 0.0f, 6.0f,
+    };
+    CHECK(axis0 == expected_axis0);
+    CHECK(std::abs(axis0_stats.tensor_norm_sq - 91.0) < 1e-9);
+    CHECK(std::abs(axis0_stats.component_norm_sq - 46.0) < 1e-9);
+    CHECK(magnitudes.size() == 2);
+    CHECK(std::abs(magnitudes[0] - std::sqrt(5.0)) < 1e-9);
+    CHECK(std::abs(magnitudes[1] - std::sqrt(41.0)) < 1e-9);
+
+    auto linear = tensor_2d(2, 3);
+    std::vector<float> axis1 = {
+        1.0f, 4.0f,
+        2.0f, 5.0f,
+        3.0f, 6.0f,
+    };
+    const auto axis1_stats = llama_direction_orthogonalize_subspace_f32(
+            axis1.data(), &linear, basis, 1.0f, 1, 4);
+    const std::vector<float> expected_axis1 = {
+        0.0f, 0.0f,
+        0.0f, 0.0f,
+        3.0f, 6.0f,
+    };
+    CHECK(axis1 == expected_axis1);
+    CHECK(std::abs(axis1_stats.tensor_norm_sq - 91.0) < 1e-9);
+    CHECK(std::abs(axis1_stats.component_norm_sq - 46.0) < 1e-9);
+}
+
+static void test_principal_subspace() {
+    const std::vector<std::vector<float>> layers = {
+        { 1.0f, 0.0f, 0.0f },
+        { 2.0f, 0.0f, 0.0f }, // normalization makes this a second e0 sample
+        { 0.0f, 3.0f, 0.0f },
+    };
+    const auto subspace = llama_direction_principal_subspace(layers, 2);
+    CHECK(subspace.basis.size() == 2);
+    CHECK(subspace.eigenvalues.size() == 2);
+    CHECK(std::abs(subspace.eigenvalues[0] - 2.0) < 1e-9);
+    CHECK(std::abs(subspace.eigenvalues[1] - 1.0) < 1e-9);
+    CHECK(std::abs(subspace.captured_energy_fraction - 1.0) < 1e-12);
+    CHECK(std::abs(std::abs(subspace.basis[0][0]) - 1.0f) < 1e-6f);
+    CHECK(std::abs(std::abs(subspace.basis[1][1]) - 1.0f) < 1e-6f);
+    double dot = 0.0;
+    for (size_t index = 0; index < subspace.basis[0].size(); ++index) {
+        dot += double(subspace.basis[0][index]) * subspace.basis[1][index];
+    }
+    CHECK(std::abs(dot) < 1e-7);
+
+    bool rejected_excess_rank = false;
+    try {
+        (void) llama_direction_principal_subspace(layers, 3);
+    } catch (const std::runtime_error &) {
+        rejected_excess_rank = true;
+    }
+    CHECK(rejected_excess_rank);
+
+    // Exercise the Jacobi rotations with a non-diagonal covariance matrix.
+    // The normalized rows below produce X^T X = [[1.64, 0.48],
+    // [0.48, 1.36]], whose eigenpairs are (2, [0.8, 0.6]) and
+    // (1, [-0.6, 0.8]).
+    const std::vector<std::vector<float>> rotated_layers = {
+        { 1.0f, 0.0f },
+        { 0.8f, 0.6f },
+        { 0.0f, 1.0f },
+    };
+    const auto rotated = llama_direction_principal_subspace(rotated_layers, 2);
+    CHECK(std::abs(rotated.eigenvalues[0] - 2.0) < 1e-9);
+    CHECK(std::abs(rotated.eigenvalues[1] - 1.0) < 1e-9);
+    CHECK(std::abs(rotated.captured_energy_fraction - 1.0) < 1e-12);
+    CHECK(close(rotated.basis[0][0],  0.8f));
+    CHECK(close(rotated.basis[0][1],  0.6f));
+    CHECK(close(rotated.basis[1][0], -0.6f));
+    CHECK(close(rotated.basis[1][1],  0.8f));
+}
+
 int main() {
     test_axis_0();
     test_axis_1_and_slices();
@@ -270,6 +361,8 @@ int main() {
     test_measurement_only_and_zero_tensor();
     test_projection_invariants();
     test_quantization_residual_compensation();
+    test_subspace_projection();
+    test_principal_subspace();
     std::puts("direction projection tests passed");
     return 0;
 }

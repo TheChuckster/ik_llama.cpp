@@ -7,6 +7,7 @@
 
 #include "common.h"
 #include "llama.h"
+#include "llama-direction-subspace.h"
 
 #include <cstdio>
 #include <cstring>
@@ -153,7 +154,7 @@ static bool try_parse_ftype(const std::string & ftype_str_in, llama_ftype & ftyp
 //
 [[noreturn]]
 static void usage(const char * executable) {
-    printf("usage: %s [--help] [--allow-requantize] [--leave-output-tensor] [--pure] [--imatrix] [--hide-imatrix] [--ignore-imatrix-rules] [--dry-run] [--include-weights] [--exclude-weights] [--output-tensor-type] [--token-embedding-type] [--per-layer-token-embedding-type] [--extra-output-tensor] [--fudge-factors] [--ffn-gate-inp-type] [--attn-q-type] [--attn-k-type] [--attn-v-type] [--attn-qkv-type] [--attn-output-type] [--ffn-gate-type] [--ffn-down-type] [--ffn-up-type] [--repack] [--repack-pattern] [--keep-pattern] [--keep-f32] [--keep-split] [--partial-requant] [--orthogonalize-control-vector] [--orthogonalize-layer-range] [--orthogonalize-pattern] [--orthogonalize-scale] [--orthogonalize-expected-count] [--orthogonalize-quant-passes] [--orthogonalize-max-residual] [--override-kv] model-f32.gguf [model-quant.gguf] type [nthreads]\n\n", executable);
+    printf("usage: %s [--help] [--allow-requantize] [--leave-output-tensor] [--pure] [--imatrix] [--hide-imatrix] [--ignore-imatrix-rules] [--dry-run] [--include-weights] [--exclude-weights] [--output-tensor-type] [--token-embedding-type] [--per-layer-token-embedding-type] [--extra-output-tensor] [--fudge-factors] [--ffn-gate-inp-type] [--attn-q-type] [--attn-k-type] [--attn-v-type] [--attn-qkv-type] [--attn-output-type] [--ffn-gate-type] [--ffn-down-type] [--ffn-up-type] [--repack] [--repack-pattern] [--keep-pattern] [--keep-f32] [--keep-split] [--partial-requant] [--orthogonalize-control-vector] [--orthogonalize-layer-range] [--orthogonalize-subspace-rank] [--orthogonalize-patch-existing] [--orthogonalize-pattern] [--orthogonalize-scale] [--orthogonalize-expected-count] [--orthogonalize-quant-passes] [--orthogonalize-max-residual] [--override-kv] model-f32.gguf [model-quant.gguf] type [nthreads]\n\n", executable);
     printf("  --allow-requantize: Allows requantizing tensors that have already been quantized. Warning: This can severely reduce quality compared to quantizing from 16bit or 32bit\n");
     printf("  --leave-output-tensor: Will leave output.weight un(re)quantized. Increases model size but may also increase quality, especially when requantizing\n");
     printf("  --pure: Disable k-quant mixtures and quantize all tensors to the same type\n");
@@ -179,6 +180,10 @@ static void usage(const char * executable) {
     printf("  --orthogonalize-control-vector FNAME: project a normalized band-average from this control-vector GGUF\n");
     printf("      out of selected residual-write tensors immediately before quantization. The input model is never edited.\n");
     printf("  --orthogonalize-layer-range START END: inclusive 1-based control-vector layer band to average.\n");
+    printf("  --orthogonalize-subspace-rank N: project the leading N principal directions from the normalized layer band\n");
+    printf("      instead of its average. N must be no larger than the band width; omitted preserves single-direction behavior.\n");
+    printf("  --orthogonalize-patch-existing: write only selected projected tensor payloads into an existing,\n");
+    printf("      layout-compatible output model. Metadata and all non-selected payloads remain untouched.\n");
     printf("  --orthogonalize-pattern REGEXS: comma-separated tensor-name regexes to project. Required with a vector.\n");
     printf("  --orthogonalize-scale F: projection strength in (0, 1], default 1.0.\n");
     printf("  --orthogonalize-expected-count N: fail before writing unless exactly N tensors match.\n\n");
@@ -384,7 +389,7 @@ static bool parse_fudge_factors(const std::string & arg, std::unordered_map<ggml
     return true;
 }
 
-static std::vector<float> load_band_averaged_direction(
+static std::vector<std::vector<float>> load_normalized_band_directions(
         const std::string & fname,
         int layer_start,
         int layer_end) {
@@ -406,12 +411,11 @@ static std::vector<float> load_band_averaged_direction(
                 layer_start, layer_end, n_layers));
     }
 
-    std::vector<float> result(cvec.n_embd, 0.0f);
     std::vector<std::vector<float>> normalized_layers;
     normalized_layers.reserve(layer_end - layer_start + 1);
 
-    // Normalize each layer before averaging. Otherwise a high-norm outlier can
-    // rotate the selected direction away from the stable layer band.
+    // Normalize each layer before either averaging it or decomposing its
+    // subspace. Otherwise a high-norm outlier can dominate either operation.
     for (int il = layer_start; il <= layer_end; ++il) {
         const float * src = cvec.data.data() + (il - 1) * cvec.n_embd;
         double norm_sq = 0.0;
@@ -425,7 +429,27 @@ static std::vector<float> load_band_averaged_direction(
         auto & normalized = normalized_layers.emplace_back(cvec.n_embd);
         for (int i = 0; i < cvec.n_embd; ++i) {
             normalized[i] = src[i] * inv_norm;
-            result[i] += normalized[i];
+        }
+    }
+    return normalized_layers;
+}
+
+static std::vector<float> load_band_averaged_direction(
+        const std::string & fname,
+        int layer_start,
+        int layer_end) {
+    auto normalized_layers = load_normalized_band_directions(fname, layer_start, layer_end);
+    if (layer_start <= 0) {
+        layer_start = 1;
+    }
+    if (layer_end <= 0) {
+        layer_end = layer_start + normalized_layers.size() - 1;
+    }
+    const size_t width = normalized_layers.front().size();
+    std::vector<float> result(width, 0.0f);
+    for (const auto & layer : normalized_layers) {
+        for (size_t index = 0; index < width; ++index) {
+            result[index] += layer[index];
         }
     }
 
@@ -445,17 +469,46 @@ static std::vector<float> load_band_averaged_direction(
     cosines.reserve(normalized_layers.size());
     for (const auto & layer : normalized_layers) {
         double cosine = 0.0;
-        for (int i = 0; i < cvec.n_embd; ++i) {
+        for (size_t i = 0; i < width; ++i) {
             cosine += double(layer[i]) * result[i];
         }
         cosines.push_back(cosine);
     }
     std::sort(cosines.begin(), cosines.end());
-    printf("orthogonalize: loaded %d-dimensional direction from layers %d-%d; cosine to band mean min/median/max %.6f/%.6f/%.6f\n",
-            cvec.n_embd, layer_start, layer_end,
+    printf("orthogonalize: loaded %zu-dimensional direction from layers %d-%d; cosine to band mean min/median/max %.6f/%.6f/%.6f\n",
+            width, layer_start, layer_end,
             cosines.front(), cosines[cosines.size()/2], cosines.back());
 
     return result;
+}
+
+static std::vector<std::vector<float>> load_band_principal_directions(
+        const std::string & fname,
+        int layer_start,
+        int layer_end,
+        int rank) {
+    auto normalized_layers = load_normalized_band_directions(fname, layer_start, layer_end);
+    if (rank < 1 || rank > (int) normalized_layers.size()) {
+        throw std::runtime_error(format(
+                "orthogonalization subspace rank %d is outside the selected band width 1-%zu",
+                rank, normalized_layers.size()));
+    }
+    if (layer_start <= 0) {
+        layer_start = 1;
+    }
+    if (layer_end <= 0) {
+        layer_end = layer_start + normalized_layers.size() - 1;
+    }
+
+    const auto subspace = llama_direction_principal_subspace(normalized_layers, rank);
+    printf("orthogonalize: loaded rank-%d principal subspace from %zu normalized %zu-dimensional layer directions %d-%d; captured-energy=%.6f; eigenvalues=",
+            rank, normalized_layers.size(), normalized_layers.front().size(),
+            layer_start, layer_end, subspace.captured_energy_fraction);
+    for (size_t index = 0; index < subspace.eigenvalues.size(); ++index) {
+        printf("%s%.6f", index == 0 ? "" : ",", subspace.eigenvalues[index]);
+    }
+    printf("\n");
+    return subspace.basis;
 }
 
 int main(int argc, char ** argv) {
@@ -477,9 +530,11 @@ int main(int argc, char ** argv) {
     std::vector<std::string> keep_patterns;
     std::vector<std::string> orthogonalize_patterns;
     std::vector<float> orthogonalize_direction;
+    std::vector<std::vector<float>> orthogonalize_directions;
     std::string orthogonalize_control_vector;
     int orthogonalize_layer_start = -1;
     int orthogonalize_layer_end = -1;
+    int orthogonalize_subspace_rank = 0;
 
     std::unordered_map<ggml_type, float> fudge_factors;
 
@@ -527,6 +582,14 @@ int main(int argc, char ** argv) {
             } else {
                 usage(argv[0]);
             }
+        } else if (strcmp(argv[arg_idx], "--orthogonalize-subspace-rank") == 0) {
+            if (arg_idx < argc-1) {
+                orthogonalize_subspace_rank = std::stoi(argv[++arg_idx]);
+            } else {
+                usage(argv[0]);
+            }
+        } else if (strcmp(argv[arg_idx], "--orthogonalize-patch-existing") == 0) {
+            params.orthogonalize_patch_existing = true;
         } else if (strcmp(argv[arg_idx], "--orthogonalize-pattern") == 0) {
             if (arg_idx < argc-1) {
                 auto p = string_split(argv[++arg_idx], ',');
@@ -702,6 +765,10 @@ int main(int argc, char ** argv) {
             fprintf(stderr, "--orthogonalize-scale must be finite and in (0, 1]\n");
             return 1;
         }
+        if (orthogonalize_subspace_rank < 0) {
+            fprintf(stderr, "--orthogonalize-subspace-rank must be positive when supplied\n");
+            return 1;
+        }
         if (!std::isfinite(params.orthogonalize_max_residual) || params.orthogonalize_max_residual > 1.0f) {
             fprintf(stderr, "--orthogonalize-max-residual must be finite and <= 1\n");
             return 1;
@@ -718,13 +785,26 @@ int main(int argc, char ** argv) {
             fprintf(stderr, "--orthogonalize-quant-passes above 1 requires --orthogonalize-scale 1\n");
             return 1;
         }
-        orthogonalize_direction = load_band_averaged_direction(
-                orthogonalize_control_vector, orthogonalize_layer_start, orthogonalize_layer_end);
-        params.orthogonalize_direction = &orthogonalize_direction;
+        if (params.orthogonalize_patch_existing && !params.keep_split) {
+            fprintf(stderr, "--orthogonalize-patch-existing requires --keep-split\n");
+            return 1;
+        }
+        if (orthogonalize_subspace_rank > 0) {
+            orthogonalize_directions = load_band_principal_directions(
+                    orthogonalize_control_vector, orthogonalize_layer_start,
+                    orthogonalize_layer_end, orthogonalize_subspace_rank);
+            params.orthogonalize_directions = &orthogonalize_directions;
+        } else {
+            orthogonalize_direction = load_band_averaged_direction(
+                    orthogonalize_control_vector, orthogonalize_layer_start, orthogonalize_layer_end);
+            params.orthogonalize_direction = &orthogonalize_direction;
+        }
         params.orthogonalize_pattern = &orthogonalize_patterns;
     } else if (!orthogonalize_patterns.empty() || params.orthogonalize_expected_count > 0 ||
                params.orthogonalize_quant_passes != 1 ||
                params.orthogonalize_max_residual >= 0.0f ||
+               params.orthogonalize_patch_existing ||
+               orthogonalize_subspace_rank != 0 ||
                orthogonalize_layer_start > 0 || orthogonalize_layer_end > 0) {
         fprintf(stderr, "orthogonalization options require --orthogonalize-control-vector\n");
         return 1;

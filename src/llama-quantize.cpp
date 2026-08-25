@@ -1233,16 +1233,32 @@ static void llama_model_quantize_internal(const std::string & fname_inp, const s
     const std::vector<std::string> * keep_pattern = nullptr;
     if (params->keep_pattern) keep_pattern = (const std::vector<std::string> *)params->keep_pattern;
 
-    const std::vector<float> * orthogonalize_direction = nullptr;
+    std::vector<std::vector<float>> single_direction_basis;
+    const std::vector<std::vector<float>> * orthogonalize_directions = nullptr;
     const std::vector<std::string> * orthogonalize_pattern = nullptr;
     std::unordered_map<std::string, int> orthogonalize_axes;
     size_t orthogonalize_f32_count = 0;
-    if (params->orthogonalize_direction || params->orthogonalize_pattern) {
-        if (!params->orthogonalize_direction || !params->orthogonalize_pattern) {
-            throw std::runtime_error("orthogonalize_direction and orthogonalize_pattern must be supplied together");
+    const bool has_single_direction = params->orthogonalize_direction != nullptr;
+    const bool has_direction_basis = params->orthogonalize_directions != nullptr;
+    if (has_single_direction || has_direction_basis || params->orthogonalize_pattern) {
+        if ((!has_single_direction && !has_direction_basis) || !params->orthogonalize_pattern) {
+            throw std::runtime_error("an orthogonalization direction basis and pattern must be supplied together");
+        }
+        if (has_single_direction && has_direction_basis) {
+            throw std::runtime_error("supply either one orthogonalization direction or a direction basis, not both");
         }
         if (params->only_copy || params->only_repack) {
             throw std::runtime_error("direction orthogonalization cannot be combined with copy-only or repack-only mode");
+        }
+        if (params->orthogonalize_patch_existing && params->partial_requant) {
+            throw std::runtime_error("patch-existing orthogonalization cannot be combined with partial-requant mode");
+        }
+        if (params->orthogonalize_patch_existing && !params->keep_split) {
+            throw std::runtime_error("patch-existing orthogonalization requires keep-split mode");
+        }
+        if (params->orthogonalize_patch_existing &&
+                (params->kv_overrides || params->extra_output_type != GGML_TYPE_COUNT)) {
+            throw std::runtime_error("patch-existing orthogonalization cannot change metadata or add an output tensor");
         }
         if (!std::isfinite(params->orthogonalize_scale) ||
                 params->orthogonalize_scale <= 0.0f || params->orthogonalize_scale > 1.0f) {
@@ -1261,23 +1277,48 @@ static void llama_model_quantize_internal(const std::string & fname_inp, const s
         if (params->orthogonalize_quant_passes > 1 && params->orthogonalize_scale != 1.0f) {
             throw std::runtime_error("orthogonalize_quant_passes above 1 requires full projection (scale 1)");
         }
-        orthogonalize_direction = (const std::vector<float> *) params->orthogonalize_direction;
+        if (has_single_direction) {
+            single_direction_basis.push_back(
+                    *(const std::vector<float> *) params->orthogonalize_direction);
+            orthogonalize_directions = &single_direction_basis;
+        } else {
+            orthogonalize_directions =
+                    (const std::vector<std::vector<float>> *) params->orthogonalize_directions;
+        }
         orthogonalize_pattern = (const std::vector<std::string> *) params->orthogonalize_pattern;
-        if (orthogonalize_direction->size() != model.hparams.n_embd) {
-            throw std::runtime_error(format(
-                    "orthogonalization direction has %zu elements, model residual width is %u",
-                    orthogonalize_direction->size(), model.hparams.n_embd));
+        if (orthogonalize_directions->empty()) {
+            throw std::runtime_error("orthogonalization direction basis is empty");
         }
-        double direction_norm_sq = 0.0;
-        for (float value : *orthogonalize_direction) {
-            if (!std::isfinite(value)) {
-                throw std::runtime_error("orthogonalization direction contains a non-finite value");
+        for (size_t index = 0; index < orthogonalize_directions->size(); ++index) {
+            const auto & direction = (*orthogonalize_directions)[index];
+            if (direction.size() != model.hparams.n_embd) {
+                throw std::runtime_error(format(
+                        "orthogonalization direction %zu has %zu elements, model residual width is %u",
+                        index, direction.size(), model.hparams.n_embd));
             }
-            direction_norm_sq += double(value) * value;
-        }
-        if (std::abs(direction_norm_sq - 1.0) > 1e-3) {
-            throw std::runtime_error(format(
-                    "orthogonalization direction must be normalized (squared norm is %.9f)", direction_norm_sq));
+            double direction_norm_sq = 0.0;
+            for (float value : direction) {
+                if (!std::isfinite(value)) {
+                    throw std::runtime_error("orthogonalization direction contains a non-finite value");
+                }
+                direction_norm_sq += double(value) * value;
+            }
+            if (std::abs(direction_norm_sq - 1.0) > 1e-3) {
+                throw std::runtime_error(format(
+                        "orthogonalization direction %zu must be normalized (squared norm is %.9f)",
+                        index, direction_norm_sq));
+            }
+            for (size_t previous = 0; previous < index; ++previous) {
+                double dot = 0.0;
+                for (size_t col = 0; col < direction.size(); ++col) {
+                    dot += double(direction[col]) * (*orthogonalize_directions)[previous][col];
+                }
+                if (std::abs(dot) > 1e-3) {
+                    throw std::runtime_error(format(
+                            "orthogonalization directions %zu and %zu are not orthogonal (dot %.9f)",
+                            previous, index, dot));
+                }
+            }
         }
 
         std::vector<std::regex> patterns;
@@ -1311,10 +1352,11 @@ static void llama_model_quantize_internal(const std::string & fname_inp, const s
             const bool is_token_embedding = name == "token_embd.weight";
             const int axis = is_token_embedding ? 0 : 1;
             const int64_t axis_size = meta->ne[axis];
-            if (axis_size != (int64_t) orthogonalize_direction->size()) {
+            if (axis_size != (int64_t) orthogonalize_directions->front().size()) {
                 throw std::runtime_error(format(
                         "selected tensor %s has size %lld on residual axis %d, expected %zu",
-                        name.c_str(), (long long) axis_size, axis, orthogonalize_direction->size()));
+                        name.c_str(), (long long) axis_size, axis,
+                        orthogonalize_directions->front().size()));
             }
             orthogonalize_axes.emplace(name, axis);
             orthogonalize_f32_count += meta->type == GGML_TYPE_F32;
@@ -1328,12 +1370,15 @@ static void llama_model_quantize_internal(const std::string & fname_inp, const s
                     "orthogonalization matched %zu tensors, expected exactly %d",
                     orthogonalize_axes.size(), params->orthogonalize_expected_count));
         }
-        LLAMA_LOG_INFO("%s: orthogonalization preflight matched %zu tensors; selected-F32=%zu; scale %.4f; quant-passes %d; input files remain read-only\n",
+        LLAMA_LOG_INFO("%s: orthogonalization preflight matched %zu tensors; selected-F32=%zu; basis-rank=%zu; scale %.4f; quant-passes %d; patch-existing=%s; input files remain read-only\n",
                 __func__, orthogonalize_axes.size(), orthogonalize_f32_count,
-                params->orthogonalize_scale, params->orthogonalize_quant_passes);
+                orthogonalize_directions->size(),
+                params->orthogonalize_scale, params->orthogonalize_quant_passes,
+                params->orthogonalize_patch_existing ? "yes" : "no");
     } else if (params->orthogonalize_expected_count > 0 ||
             params->orthogonalize_quant_passes != 1 ||
-            params->orthogonalize_max_residual >= 0.0f) {
+            params->orthogonalize_max_residual >= 0.0f ||
+            params->orthogonalize_patch_existing) {
         throw std::runtime_error("orthogonalization controls require a direction and pattern");
     }
 
@@ -1434,6 +1479,57 @@ static void llama_model_quantize_internal(const std::string & fname_inp, const s
             n_split = std::max(uint16_t(ml.get_weight(i)->idx+1), n_split);
         }
     }
+
+    // A layout-compatible existing model can act as a copy-on-write template.
+    // This mode never regenerates headers or streams non-selected payloads: it
+    // validates the complete tensor name/shape layout, then overwrites only the
+    // selected, projected payload ranges. The caller is responsible for making
+    // the output a distinct inode (the K3 kit uses cp --reflink=always and
+    // verifies device/inode pairs before invoking us).
+    std::unique_ptr<llama_model_loader> patch_ml;
+    std::vector<std::unique_ptr<llama_file>> patch_files;
+    if (params->orthogonalize_patch_existing) {
+        char first_split_path[PATH_MAX] = {0};
+        llama_split_path(first_split_path, sizeof(first_split_path), fname_out.c_str(), 0, n_split);
+        patch_ml = std::make_unique<llama_model_loader>(
+                first_split_path, 0, /* use_mmap */ false, /* check_tensors */ true,
+                /* repack_tensors */ false, /* use_thp */ false,
+                /* merge_qkv */ false, /* merge_up_gate_exps */ false,
+                /* defer_experts */ false, nullptr, nullptr);
+        if (patch_ml->n_tensors != ml.n_tensors || patch_ml->files.size() != n_split) {
+            throw std::runtime_error(format(
+                    "patch-existing output layout differs: tensors %d/%d, splits %zu/%u",
+                    patch_ml->n_tensors, ml.n_tensors, patch_ml->files.size(), n_split));
+        }
+        for (int i = 0; i < ml.n_tensors; ++i) {
+            const ggml_tensor * source = ml.get_tensor_meta(i);
+            const auto * patch_weight = patch_ml->get_weight(ggml_get_name(source));
+            if (!patch_weight) {
+                throw std::runtime_error(
+                        "patch-existing output is missing tensor " + std::string(ggml_get_name(source)));
+            }
+            const ggml_tensor * patch = patch_weight->tensor;
+            if (ggml_n_dims(source) != ggml_n_dims(patch)) {
+                throw std::runtime_error(
+                        "patch-existing output rank differs for tensor " + std::string(ggml_get_name(source)));
+            }
+            for (int dim = 0; dim < ggml_n_dims(source); ++dim) {
+                if (source->ne[dim] != patch->ne[dim]) {
+                    throw std::runtime_error(
+                            "patch-existing output shape differs for tensor " + std::string(ggml_get_name(source)));
+                }
+            }
+        }
+        if (!params->dry_run) {
+            patch_files.reserve(patch_ml->files.size());
+            for (const auto & file : patch_ml->files) {
+                patch_files.emplace_back(
+                        std::make_unique<llama_file>(file->get_path().c_str(), "r+b"));
+            }
+        }
+        LLAMA_LOG_INFO("%s: patch-existing validated %d tensors across %zu existing output shards; only %zu selected payloads may be written\n",
+                __func__, patch_ml->n_tensors, patch_ml->files.size(), orthogonalize_axes.size());
+    }
     std::vector<gguf_context*> ctx_outs(n_split, NULL);
     ctx_outs[0] = ctx_out;
 
@@ -1511,10 +1607,10 @@ static void llama_model_quantize_internal(const std::string & fname_inp, const s
         }
     };
     auto new_ofstream = [&](int index) {
-        if (params->dry_run) {
+        cur_split = index;
+        if (params->dry_run || params->orthogonalize_patch_existing) {
             return;
         }
-        cur_split = index;
         GGML_ASSERT(ctx_outs[cur_split] && "Find uninitialized gguf_context");
         std::string fname = fname_out;
         if (params->keep_split) {
@@ -1562,6 +1658,15 @@ static void llama_model_quantize_internal(const std::string & fname_inp, const s
         const auto orthogonalize_it = orthogonalize_axes.find(name);
         const bool needs_orthogonalization = orthogonalize_it != orthogonalize_axes.end();
         llama_direction_projection_stats orthogonalization_source_stats;
+
+        if (params->orthogonalize_patch_existing && !needs_orthogonalization) {
+            const auto * patch_weight = patch_ml->get_weight(name.c_str());
+            GGML_ASSERT(patch_weight != nullptr);
+            ++idx;
+            total_size_org += ggml_nbytes(tensor);
+            total_size_new += ggml_nbytes(patch_weight->tensor);
+            continue;
+        }
 
         if (!ml.use_mmap) {
             if (read_data.size() < ggml_nbytes(tensor)) {
@@ -1909,8 +2014,8 @@ static void llama_model_quantize_internal(const std::string & fname_inp, const s
                 }
 
                 if (needs_orthogonalization) {
-                    const auto stats = llama_direction_orthogonalize_f32(
-                            f32_data, tensor, *orthogonalize_direction,
+                    const auto stats = llama_direction_orthogonalize_subspace_f32(
+                            f32_data, tensor, *orthogonalize_directions,
                             params->orthogonalize_scale, orthogonalize_it->second, nthread);
                     if (!(stats.component_norm_sq > 0.0) || !std::isfinite(stats.component_norm_sq) ||
                             !(stats.tensor_norm_sq > 0.0) || !std::isfinite(stats.tensor_norm_sq)) {
@@ -2001,16 +2106,16 @@ static void llama_model_quantize_internal(const std::string & fname_inp, const s
                         quantized.data = new_data;
                         llama_tensor_dequantize_internal(
                                 &quantized, post_quant_buf, workers, nelements, nthread);
-                        std::vector<double> component_coefficients;
+                        std::vector<double> component_magnitudes;
                         // A damped step explores the discontinuous quantized
                         // code space without the two-point oscillation caused
                         // by subtracting the full decoded residue.
                         const float correction_scale = pass < params->orthogonalize_quant_passes ? 0.25f : 0.0f;
-                        const auto post_stats = llama_direction_remove_measured_component_f32(
+                        const auto post_stats = llama_direction_remove_measured_subspace_f32(
                                 f32_data, (const float *) post_quant_buf.data(), tensor,
-                                *orthogonalize_direction, correction_scale,
+                                *orthogonalize_directions, correction_scale,
                                 orthogonalize_it->second, nthread,
-                                orthogonalize_it->second == 0 ? &component_coefficients : nullptr);
+                                orthogonalize_it->second == 0 ? &component_magnitudes : nullptr);
                         if (!(post_stats.component_norm_sq >= 0.0) ||
                                 !std::isfinite(post_stats.component_norm_sq) ||
                                 !(post_stats.tensor_norm_sq >= 0.0) ||
@@ -2037,17 +2142,17 @@ static void llama_model_quantize_internal(const std::string & fname_inp, const s
                             // strictly no worse than any whole-pass candidate.
                             const size_t row_size = ggml_row_size(new_type, tensor->ne[0]);
                             const int64_t n_rows = nelements / tensor->ne[0];
-                            GGML_ASSERT(component_coefficients.size() == (size_t) n_rows);
+                            GGML_ASSERT(component_magnitudes.size() == (size_t) n_rows);
                             GGML_ASSERT(row_size * n_rows == new_size);
                             if (best_component_magnitudes.empty()) {
                                 best_component_magnitudes.resize(n_rows);
                                 std::memcpy(best_quant_buf.data(), new_data, new_size);
                                 for (int64_t row = 0; row < n_rows; ++row) {
-                                    best_component_magnitudes[row] = std::abs(component_coefficients[row]);
+                                    best_component_magnitudes[row] = component_magnitudes[row];
                                 }
                             } else {
                                 for (int64_t row = 0; row < n_rows; ++row) {
-                                    const double magnitude = std::abs(component_coefficients[row]);
+                                    const double magnitude = component_magnitudes[row];
                                     if (magnitude < best_component_magnitudes[row]) {
                                         best_component_magnitudes[row] = magnitude;
                                         std::memcpy(best_quant_buf.data() + row * row_size,
@@ -2090,8 +2195,8 @@ static void llama_model_quantize_internal(const std::string & fname_inp, const s
                     best_quantized.data = new_data;
                     llama_tensor_dequantize_internal(
                             &best_quantized, post_quant_buf, workers, nelements, nthread);
-                    const auto best_post_stats = llama_direction_orthogonalize_f32(
-                            (float *) post_quant_buf.data(), tensor, *orthogonalize_direction,
+                    const auto best_post_stats = llama_direction_orthogonalize_subspace_f32(
+                            (float *) post_quant_buf.data(), tensor, *orthogonalize_directions,
                             0.0f, orthogonalize_it->second, nthread);
                     const double post_tensor_ratio = best_post_stats.tensor_norm_sq > 0.0
                             ? std::sqrt(best_post_stats.component_norm_sq / best_post_stats.tensor_norm_sq)
@@ -2120,10 +2225,34 @@ static void llama_model_quantize_internal(const std::string & fname_inp, const s
         }
 
 QuantizationDone:;
+        if (params->orthogonalize_patch_existing) {
+            if (!needs_orthogonalization) {
+                throw std::runtime_error("patch-existing reached an unselected tensor unexpectedly: " + name);
+            }
+            const auto * patch_weight = patch_ml->get_weight(name.c_str());
+            if (!patch_weight) {
+                throw std::runtime_error("patch-existing output lost tensor " + name);
+            }
+            if (patch_weight->tensor->type != new_type || ggml_nbytes(patch_weight->tensor) != new_size) {
+                throw std::runtime_error(format(
+                        "patch-existing layout mismatch for %s: output %s/%zu bytes, generated %s/%zu bytes",
+                        name.c_str(), ggml_type_name(patch_weight->tensor->type),
+                        ggml_nbytes(patch_weight->tensor), ggml_type_name(new_type), new_size));
+            }
+            if (!params->dry_run) {
+                if (!new_data || patch_weight->idx >= patch_files.size()) {
+                    throw std::runtime_error("patch-existing has no writable payload for " + name);
+                }
+                patch_files[patch_weight->idx]->seek(patch_weight->offs, SEEK_SET);
+                patch_files[patch_weight->idx]->write_raw(new_data, new_size);
+                LLAMA_LOG_INFO("orthogonalize: %s patched-existing shard=%u offset=%zu bytes=%zu\n",
+                        name.c_str(), patch_weight->idx, patch_weight->offs, new_size);
+            }
+        }
         total_size_org += ggml_nbytes(tensor);
         total_size_new += new_size;
 
-        if (!params->dry_run && !split_skipped[cur_split]) {
+        if (!params->dry_run && !params->orthogonalize_patch_existing && !split_skipped[cur_split]) {
             // update the gguf meta data as we go
             gguf_set_tensor_type(ctx_outs[cur_split], name.c_str(), new_type);
             gguf_set_tensor_data(ctx_outs[cur_split], name.c_str(), new_data, new_size);

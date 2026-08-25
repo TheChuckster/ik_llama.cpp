@@ -72,6 +72,40 @@ More than one pass requires full (`1.0`) projection and an enabled residual
 limit. Use `--keep-pattern` for tensors that must be copied byte-for-byte. A
 tensor may not match both sets.
 
+To remove a layer-varying refusal subspace instead of one band-average vector,
+add `--orthogonalize-subspace-rank N`. The quantizer normalizes every selected
+layer direction, computes the leading `N` right-singular vectors with a
+dependency-free Jacobi eigensolver, reorthogonalizes the resulting F32 basis,
+and reports its eigenvalues and captured energy. Omitting the option preserves
+the original single-direction behavior.
+
+For a very large model whose output layout is already available, an existing
+copy-on-write clone can be patched without streaming every non-selected tensor:
+
+```bash
+cp --reflink=always ./reference-00001-of-00002.gguf ./candidate-00001-of-00002.gguf
+cp --reflink=always ./reference-00002-of-00002.gguf ./candidate-00002-of-00002.gguf
+./llama-quantize \
+    --allow-requantize --keep-split \
+    --orthogonalize-control-vector ./direction.gguf \
+    --orthogonalize-layer-range 20 31 \
+    --orthogonalize-subspace-rank 6 \
+    --orthogonalize-patch-existing \
+    --orthogonalize-pattern '^blk\.[0-9]+\.attn_output\.weight$' \
+    --orthogonalize-expected-count 32 \
+    ./model-input-00001-of-00002.gguf ./candidate.gguf Q5_K
+```
+
+Patch-existing mode requires `--keep-split` and an already complete output. It
+validates every tensor name and shape across every shard before opening the
+output writable, then validates each selected generated type and byte length
+before writing only that payload range. It never rewrites metadata, padding,
+or non-selected payloads. The caller must prove that output shards are distinct
+inodes rather than hard links and should run a complete post-build byte audit;
+the quantizer cannot infer which external reference was cloned. A failed run
+may leave a partially patched output, so publish a separate completion marker
+only after independent verification.
+
 When running the larger models, make sure you have enough disk space to store all the intermediate files.
 
 ## Memory/Disk Requirements

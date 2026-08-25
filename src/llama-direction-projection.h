@@ -168,4 +168,69 @@ inline llama_direction_projection_stats llama_direction_orthogonalize_f32(
             data, data, tensor, direction, scale, axis, nthread);
 }
 
+// Measure and remove an orthonormal direction basis. Component energy is the
+// sum of squared coefficients across the basis. When requested, per-vector
+// coefficient arrays are reduced to one Euclidean magnitude per tensor row or
+// input column; the quantizer uses those magnitudes to retain the best encoded
+// embedding row across correction passes.
+inline llama_direction_projection_stats llama_direction_remove_measured_subspace_f32(
+        float * target,
+        const float * measured,
+        const ggml_tensor * tensor,
+        const std::vector<std::vector<float>> & basis,
+        float scale,
+        int axis,
+        int nthread,
+        std::vector<double> * component_magnitudes = nullptr) {
+    GGML_ASSERT(!basis.empty());
+    llama_direction_projection_stats result;
+    std::vector<double> magnitude_sq;
+    if (component_magnitudes) {
+        const int64_t count = axis == 0
+                ? tensor->ne[1] * tensor->ne[2] * tensor->ne[3]
+                : tensor->ne[0] * tensor->ne[2] * tensor->ne[3];
+        magnitude_sq.assign(count, 0.0);
+    }
+
+    bool first = true;
+    for (const auto & direction : basis) {
+        std::vector<double> coefficients;
+        const auto stats = llama_direction_remove_measured_component_f32(
+                target, measured, tensor, direction, scale, axis, nthread,
+                component_magnitudes ? &coefficients : nullptr);
+        if (first) {
+            // If target and measured alias, later basis projections reduce the
+            // target norm. The first pass is the norm of the original tensor.
+            result.tensor_norm_sq = stats.tensor_norm_sq;
+            first = false;
+        }
+        result.component_norm_sq += stats.component_norm_sq;
+        if (component_magnitudes) {
+            GGML_ASSERT(coefficients.size() == magnitude_sq.size());
+            for (size_t index = 0; index < coefficients.size(); ++index) {
+                magnitude_sq[index] += coefficients[index] * coefficients[index];
+            }
+        }
+    }
+
+    if (component_magnitudes) {
+        component_magnitudes->resize(magnitude_sq.size());
+        for (size_t index = 0; index < magnitude_sq.size(); ++index) {
+            (*component_magnitudes)[index] = std::sqrt(magnitude_sq[index]);
+        }
+    }
+    return result;
+}
+
+inline llama_direction_projection_stats llama_direction_orthogonalize_subspace_f32(
+        float * data,
+        const ggml_tensor * tensor,
+        const std::vector<std::vector<float>> & basis,
+        float scale,
+        int axis,
+        int nthread) {
+    return llama_direction_remove_measured_subspace_f32(
+            data, data, tensor, basis, scale, axis, nthread);
+}
+
 #endif // LLAMA_DIRECTION_PROJECTION_H

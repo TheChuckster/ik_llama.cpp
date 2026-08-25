@@ -547,12 +547,14 @@ extern "C" {
         bool dry_run;                        //
         bool partial_requant;                // quantize only missing split files in the split quantized .gguf destination directory
         bool keep_f32;                       // when requantizing, leave tensors that arrive as F32 as F32
+        bool orthogonalize_patch_existing;   // patch only selected projected payloads in an existing layout-compatible output
         void * imatrix;                      // pointer to importance matrix data
         void * kv_overrides;                 // pointer to vector containing overrides
         void * custom_quants;                // pointer to vector containing custom quantization rules
         void * repack_pattern;               // pointer to a vector containing regexes to be used for matching tensor names. Can be null
         void * keep_pattern;                 // regexes for tensors to COPY VERBATIM, never (re)quantize. Can be null
-        void * orthogonalize_direction;       // pointer to a normalized vector<float> to project out while quantizing. Can be null
+        void * orthogonalize_direction;       // pointer to one normalized vector<float> to project out. Can be null
+        void * orthogonalize_directions;      // pointer to an orthonormal vector<vector<float>> basis. Can be null
         void * orthogonalize_pattern;         // regexes selecting tensors whose residual-write axis is projected. Can be null
         float orthogonalize_scale;            // 1.0 removes the selected direction completely
         int32_t orthogonalize_expected_count; // fail before writing unless exactly this many tensors match; <= 0 disables the count check
