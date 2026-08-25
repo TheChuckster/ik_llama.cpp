@@ -1261,8 +1261,8 @@ static void llama_model_quantize_internal(const std::string & fname_inp, const s
             throw std::runtime_error("patch-existing orthogonalization cannot change metadata or add an output tensor");
         }
         if (!std::isfinite(params->orthogonalize_scale) ||
-                params->orthogonalize_scale <= 0.0f || params->orthogonalize_scale > 1.0f) {
-            throw std::runtime_error("orthogonalize_scale must be finite and in (0, 1]");
+                params->orthogonalize_scale <= 0.0f || params->orthogonalize_scale > 2.0f) {
+            throw std::runtime_error("orthogonalize_scale must be finite and in (0, 2]");
         }
         if (!std::isfinite(params->orthogonalize_max_residual) ||
                 params->orthogonalize_max_residual > 1.0f) {
@@ -1278,9 +1278,6 @@ static void llama_model_quantize_internal(const std::string & fname_inp, const s
         }
         if (params->orthogonalize_quant_passes > 1 && params->orthogonalize_max_residual < 0.0f) {
             throw std::runtime_error("orthogonalize_quant_passes above 1 requires a residual limit");
-        }
-        if (params->orthogonalize_quant_passes > 1 && params->orthogonalize_scale != 1.0f) {
-            throw std::runtime_error("orthogonalize_quant_passes above 1 requires full projection (scale 1)");
         }
         if (has_single_direction) {
             single_direction_basis.push_back(
@@ -1476,8 +1473,11 @@ static void llama_model_quantize_internal(const std::string & fname_inp, const s
     std::vector<no_init<uint8_t>> best_quant_buf;
     std::vector<no_init<float>> f32_conv_buf;
     std::vector<no_init<float>> post_quant_buf;
+    std::vector<no_init<float>> orthogonalization_target_buf;
     std::vector<double> orthogonalization_component_ratios;
     std::vector<double> orthogonalization_post_quant_ratios;
+    const bool orthogonalization_uses_target_relative_error =
+            params->orthogonalize_scale != 1.0f;
 
     uint16_t n_split = 1;
     // Assume split index is continuous
@@ -1665,6 +1665,7 @@ static void llama_model_quantize_internal(const std::string & fname_inp, const s
         const auto orthogonalize_it = orthogonalize_axes.find(name);
         const bool needs_orthogonalization = orthogonalize_it != orthogonalize_axes.end();
         llama_direction_projection_stats orthogonalization_source_stats;
+        const float * orthogonalization_target = nullptr;
 
         if (params->orthogonalize_patch_existing && !needs_orthogonalization) {
             const auto * patch_weight = patch_ml->get_weight(name.c_str());
@@ -2037,6 +2038,14 @@ static void llama_model_quantize_internal(const std::string & fname_inp, const s
                     LLAMA_LOG_INFO("orthogonalize: %s residual-axis=%d source-component=%.6f%% float-residual=%.6f%%\n",
                             name.c_str(), orthogonalize_it->second, 100.0 * ratio,
                             100.0 * ratio * std::abs(1.0f - params->orthogonalize_scale));
+                    if (orthogonalization_uses_target_relative_error) {
+                        if (orthogonalization_target_buf.size() < (size_t) nelements) {
+                            orthogonalization_target_buf.resize(nelements);
+                        }
+                        std::memcpy((float *) orthogonalization_target_buf.data(), f32_data,
+                                nelements * sizeof(float));
+                        orthogonalization_target = (const float *) orthogonalization_target_buf.data();
+                    }
                 }
 
                 auto expected_size = ggml_row_size(new_type, tensor->ne[0])*tensor->ne[1]*tensor->ne[2]*tensor->ne[3];
@@ -2119,11 +2128,23 @@ static void llama_model_quantize_internal(const std::string & fname_inp, const s
                         // by subtracting the full decoded residue.
                         const float correction_scale = pass < params->orthogonalize_quant_passes
                                 ? params->orthogonalize_quant_correction : 0.0f;
-                        const auto post_stats = llama_direction_remove_measured_subspace_f32(
-                                f32_data, (const float *) post_quant_buf.data(), tensor,
-                                *orthogonalize_directions, correction_scale,
-                                orthogonalize_it->second, nthread,
-                                orthogonalize_it->second == 0 ? &component_magnitudes : nullptr);
+                        llama_direction_projection_stats post_stats;
+                        if (orthogonalization_target) {
+                            post_stats = llama_direction_remove_measured_subspace_difference_f32(
+                                    f32_data, (const float *) post_quant_buf.data(),
+                                    orthogonalization_target, tensor, *orthogonalize_directions,
+                                    correction_scale, orthogonalize_it->second, nthread,
+                                    orthogonalize_it->second == 0 ? &component_magnitudes : nullptr);
+                        } else {
+                            // Preserve the exact legacy scale-1 path. Its F32
+                            // target has zero selected component, so absolute
+                            // and target-relative correction are equivalent.
+                            post_stats = llama_direction_remove_measured_subspace_f32(
+                                    f32_data, (const float *) post_quant_buf.data(), tensor,
+                                    *orthogonalize_directions, correction_scale,
+                                    orthogonalize_it->second, nthread,
+                                    orthogonalize_it->second == 0 ? &component_magnitudes : nullptr);
+                        }
                         if (!(post_stats.component_norm_sq >= 0.0) ||
                                 !std::isfinite(post_stats.component_norm_sq) ||
                                 !(post_stats.tensor_norm_sq >= 0.0) ||
@@ -2131,12 +2152,12 @@ static void llama_model_quantize_internal(const std::string & fname_inp, const s
                             throw std::runtime_error(
                                     "selected tensor " + name + " has invalid post-quant projection statistics");
                         }
-                        const double post_tensor_ratio = post_stats.tensor_norm_sq > 0.0
+                        const double error_tensor_ratio = post_stats.tensor_norm_sq > 0.0
                                 ? std::sqrt(post_stats.component_norm_sq / post_stats.tensor_norm_sq)
                                 : 0.0;
                         const double retained_ratio = llama_direction_retained_component_ratio(
                                 orthogonalization_source_stats, post_stats);
-                        if (!std::isfinite(retained_ratio) || !std::isfinite(post_tensor_ratio)) {
+                        if (!std::isfinite(retained_ratio) || !std::isfinite(error_tensor_ratio)) {
                             throw std::runtime_error(
                                     "selected tensor " + name + " has invalid post-quant projection ratios");
                         }
@@ -2182,10 +2203,17 @@ static void llama_model_quantize_internal(const std::string & fname_inp, const s
                             std::memcpy(best_quant_buf.data(), new_data, new_size);
                         }
 
-                        LLAMA_LOG_INFO("orthogonalize: %s quant-pass=%d/%d retained-source-component=%.6f%% best=%.6f%% absolute-component=%.6f%%\n",
-                                name.c_str(), pass, params->orthogonalize_quant_passes,
-                                100.0 * retained_ratio, 100.0 * best_retained_ratio,
-                                100.0 * post_tensor_ratio);
+                        if (orthogonalization_target) {
+                            LLAMA_LOG_INFO("orthogonalize: %s quant-pass=%d/%d target-error=%.6f%% best=%.6f%% error-subspace-fraction=%.6f%%\n",
+                                    name.c_str(), pass, params->orthogonalize_quant_passes,
+                                    100.0 * retained_ratio, 100.0 * best_retained_ratio,
+                                    100.0 * error_tensor_ratio);
+                        } else {
+                            LLAMA_LOG_INFO("orthogonalize: %s quant-pass=%d/%d retained-source-component=%.6f%% best=%.6f%% absolute-component=%.6f%%\n",
+                                    name.c_str(), pass, params->orthogonalize_quant_passes,
+                                    100.0 * retained_ratio, 100.0 * best_retained_ratio,
+                                    100.0 * error_tensor_ratio);
+                        }
 
                         if (params->orthogonalize_max_residual < 0.0f ||
                                 best_retained_ratio <= params->orthogonalize_max_residual) {
@@ -2203,29 +2231,66 @@ static void llama_model_quantize_internal(const std::string & fname_inp, const s
                     best_quantized.data = new_data;
                     llama_tensor_dequantize_internal(
                             &best_quantized, post_quant_buf, workers, nelements, nthread);
-                    const auto best_post_stats = llama_direction_orthogonalize_subspace_f32(
-                            (float *) post_quant_buf.data(), tensor, *orthogonalize_directions,
-                            0.0f, orthogonalize_it->second, nthread);
-                    const double post_tensor_ratio = best_post_stats.tensor_norm_sq > 0.0
-                            ? std::sqrt(best_post_stats.component_norm_sq / best_post_stats.tensor_norm_sq)
-                            : 0.0;
+                    llama_direction_projection_stats best_post_stats;
+                    if (orthogonalization_target) {
+                        best_post_stats = llama_direction_remove_measured_subspace_difference_f32(
+                                f32_data, (const float *) post_quant_buf.data(),
+                                orthogonalization_target, tensor, *orthogonalize_directions,
+                                0.0f, orthogonalize_it->second, nthread);
+                    } else {
+                        best_post_stats = llama_direction_orthogonalize_subspace_f32(
+                                (float *) post_quant_buf.data(), tensor, *orthogonalize_directions,
+                                0.0f, orthogonalize_it->second, nthread);
+                    }
                     const double retained_ratio = llama_direction_retained_component_ratio(
                             orthogonalization_source_stats, best_post_stats);
-                    if (!std::isfinite(retained_ratio) || !std::isfinite(post_tensor_ratio)) {
+                    if (!std::isfinite(retained_ratio)) {
                         throw std::runtime_error(
                                 "selected tensor " + name + " has invalid best post-quant projection ratios");
                     }
                     if (params->orthogonalize_max_residual >= 0.0f &&
                             retained_ratio > params->orthogonalize_max_residual) {
+                        if (orthogonalization_target) {
+                            throw std::runtime_error(format(
+                                    "selected tensor %s has %.6f%% target-relative subspace error after %d quantization pass(es), above limit %.6f%%",
+                                    name.c_str(), 100.0 * retained_ratio,
+                                    params->orthogonalize_quant_passes,
+                                    100.0 * params->orthogonalize_max_residual));
+                        }
                         throw std::runtime_error(format(
-                                "selected tensor %s retained %.6f%% of its source direction component after %d quantization pass(es), above limit %.6f%%",
-                                name.c_str(), 100.0 * retained_ratio,
-                                params->orthogonalize_quant_passes,
-                                100.0 * params->orthogonalize_max_residual));
+                                    "selected tensor %s retained %.6f%% of its source direction component after %d quantization pass(es), above limit %.6f%%",
+                                    name.c_str(), 100.0 * retained_ratio,
+                                    params->orthogonalize_quant_passes,
+                                    100.0 * params->orthogonalize_max_residual));
                     }
                     orthogonalization_post_quant_ratios.push_back(retained_ratio);
-                    LLAMA_LOG_INFO("orthogonalize: %s post-quant-residual=%.6f%% absolute-component=%.6f%%\n",
-                            name.c_str(), 100.0 * retained_ratio, 100.0 * post_tensor_ratio);
+                    if (orthogonalization_target) {
+                        const auto actual_post_stats = llama_direction_remove_measured_subspace_f32(
+                                f32_data, (const float *) post_quant_buf.data(), tensor,
+                                *orthogonalize_directions, 0.0f,
+                                orthogonalize_it->second, nthread);
+                        const double actual_source_ratio = llama_direction_retained_component_ratio(
+                                orthogonalization_source_stats, actual_post_stats);
+                        const double actual_tensor_ratio = actual_post_stats.tensor_norm_sq > 0.0
+                                ? std::sqrt(actual_post_stats.component_norm_sq /
+                                        actual_post_stats.tensor_norm_sq)
+                                : 0.0;
+                        if (!std::isfinite(actual_source_ratio) ||
+                                !std::isfinite(actual_tensor_ratio)) {
+                            throw std::runtime_error(
+                                    "selected tensor " + name + " has invalid actual post-quant projection ratios");
+                        }
+                        LLAMA_LOG_INFO("orthogonalize: %s post-quant-residual=%.6f%% actual-source-component=%.6f%% absolute-component=%.6f%%\n",
+                                name.c_str(), 100.0 * retained_ratio,
+                                100.0 * actual_source_ratio, 100.0 * actual_tensor_ratio);
+                    } else {
+                        const double post_tensor_ratio = best_post_stats.tensor_norm_sq > 0.0
+                                ? std::sqrt(best_post_stats.component_norm_sq /
+                                        best_post_stats.tensor_norm_sq)
+                                : 0.0;
+                        LLAMA_LOG_INFO("orthogonalize: %s post-quant-residual=%.6f%% absolute-component=%.6f%%\n",
+                                name.c_str(), 100.0 * retained_ratio, 100.0 * post_tensor_ratio);
+                    }
                 }
 
             }
@@ -2288,11 +2353,19 @@ QuantizationDone:;
     }
     if (!orthogonalization_post_quant_ratios.empty()) {
         std::sort(orthogonalization_post_quant_ratios.begin(), orthogonalization_post_quant_ratios.end());
-        LLAMA_LOG_INFO("%s: post-quant retained source component min/median/max %.6f%%/%.6f%%/%.6f%%\n",
-                __func__,
-                100.0 * orthogonalization_post_quant_ratios.front(),
-                100.0 * orthogonalization_post_quant_ratios[orthogonalization_post_quant_ratios.size()/2],
-                100.0 * orthogonalization_post_quant_ratios.back());
+        if (orthogonalization_uses_target_relative_error) {
+            LLAMA_LOG_INFO("%s: post-quant target-relative error min/median/max %.6f%%/%.6f%%/%.6f%%\n",
+                    __func__,
+                    100.0 * orthogonalization_post_quant_ratios.front(),
+                    100.0 * orthogonalization_post_quant_ratios[orthogonalization_post_quant_ratios.size()/2],
+                    100.0 * orthogonalization_post_quant_ratios.back());
+        } else {
+            LLAMA_LOG_INFO("%s: post-quant retained source component min/median/max %.6f%%/%.6f%%/%.6f%%\n",
+                    __func__,
+                    100.0 * orthogonalization_post_quant_ratios.front(),
+                    100.0 * orthogonalization_post_quant_ratios[orthogonalization_post_quant_ratios.size()/2],
+                    100.0 * orthogonalization_post_quant_ratios.back());
+        }
     }
 
     if (qs.n_fallback > 0) {

@@ -39,9 +39,10 @@ Run the quantized model:
 
 ## Direction projection during quantization
 
-The quantizer can remove a normalized control-vector direction from selected
-residual-write tensors without editing the input GGUF. Projection happens in
-F32 immediately before the selected tensors are encoded:
+The quantizer can remove or reflect a normalized control-vector subspace in
+selected residual-write tensors without editing the input GGUF. The
+intervention happens in F32 immediately before the selected tensors are
+encoded:
 
 ```bash
 ./llama-quantize \
@@ -58,23 +59,30 @@ F32 immediately before the selected tensors are encoded:
 ```
 
 The layer range is inclusive and one-based. Each selected tensor must expose a
-residual axis matching the control vector. `--orthogonalize-expected-count`
-fails during preflight, before an output is opened, if the regex set changes.
+residual axis matching the control vector. Scale `1.0` applies nullspace
+projection (`I - P`); scale `2.0` applies the orthogonal counterfactual
+reflection (`I - 2P`). Coefficients in `(0, 2]` are accepted.
+`--orthogonalize-expected-count` fails during preflight, before an output is
+opened, if the regex set changes.
+
 After quantization, `--orthogonalize-max-residual` decodes every selected
-tensor and limits the remaining direction component relative to its original
-source component; `0.02` means at most 2% retained. Q5 encoding can reintroduce
-more than that in a single pass. `--orthogonalize-quant-passes` permits bounded
-encode/decode correction passes: each retry subtracts a damped share of only the
-measured residue from the original projected F32 buffer, never from a lossy
-decoded buffer. The share defaults to `0.25` and can be pinned with
+tensor and limits selected-subspace error relative to the original source
+component. At scale 1 this is the legacy retained-component metric. At any
+other scale it is measured around the immutable intended F32 target, so a
+perfect scale-2 reflection correctly has zero error rather than 100% retained
+magnitude. `0.02` means at most 2% target-relative error. Q5 encoding can
+exceed that in a single pass. `--orthogonalize-quant-passes` permits bounded
+encode/decode correction passes: each retry subtracts a damped share of only
+the measured target-relative error from the mutable F32 encoding input, never
+from a lossy decoded buffer. The exact legacy path remains in use at scale 1.
+The share defaults to `0.25` and can be pinned with
 `--orthogonalize-quant-correction`; the preflight logs it. Up to 64 passes are
 accepted so a caller can set an explicit bounded numerical protocol. For axis-0
 embedding tensors, independently encoded rows keep
 their lowest-residual result across the bounded passes; axis-1 matrices keep the
 best whole-tensor pass because their measured columns cross quantization rows.
-More than one pass requires full (`1.0`) projection and an enabled residual
-limit. Use `--keep-pattern` for tensors that must be copied byte-for-byte. A
-tensor may not match both sets.
+More than one pass requires an enabled residual limit. Use `--keep-pattern` for
+tensors that must be copied byte-for-byte. A tensor may not match both sets.
 
 To remove a layer-varying refusal subspace instead of one band-average vector,
 add `--orthogonalize-subspace-rank N`. The quantizer normalizes every selected

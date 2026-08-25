@@ -208,6 +208,68 @@ static void test_projection_invariants() {
     }
 }
 
+static void test_counterfactual_reflection() {
+    const std::vector<float> direction = { 0.6f, 0.8f };
+
+    // Rank-one embedding orientation: the selected component flips while an
+    // orthogonal row remains unchanged. A reflection preserves total norm.
+    auto embedding = tensor_2d(2, 2);
+    std::vector<float> axis0 = {
+        3.0f,  4.0f,
+        0.8f, -0.6f,
+    };
+    const auto axis0_before = axis0;
+    const auto axis0_stats = llama_direction_orthogonalize_f32(
+            axis0.data(), &embedding, direction, 2.0f, 0, 4);
+    const std::vector<float> expected_axis0 = {
+       -3.0f, -4.0f,
+        0.8f, -0.6f,
+    };
+    for (size_t index = 0; index < axis0.size(); ++index) {
+        CHECK(close(axis0[index], expected_axis0[index]));
+    }
+    double before_norm_sq = 0.0;
+    double after_norm_sq = 0.0;
+    for (size_t index = 0; index < axis0.size(); ++index) {
+        before_norm_sq += double(axis0_before[index]) * axis0_before[index];
+        after_norm_sq += double(axis0[index]) * axis0[index];
+    }
+    CHECK(std::abs(before_norm_sq - after_norm_sq) < 1e-6);
+    CHECK(std::abs(axis0_stats.tensor_norm_sq - 26.0) < 1e-6);
+    CHECK(std::abs(axis0_stats.component_norm_sq - 25.0) < 1e-5);
+
+    // Rank-two linear-map orientation: reflect the e0/e1 rowspace and retain
+    // the e2 orthogonal row exactly.
+    const std::vector<std::vector<float>> basis = {
+        { 1.0f, 0.0f, 0.0f },
+        { 0.0f, 1.0f, 0.0f },
+    };
+    auto linear = tensor_2d(2, 3);
+    std::vector<float> axis1 = {
+        1.0f, 4.0f,
+        2.0f, 5.0f,
+        3.0f, 6.0f,
+    };
+    const auto axis1_before = axis1;
+    const auto axis1_stats = llama_direction_orthogonalize_subspace_f32(
+            axis1.data(), &linear, basis, 2.0f, 1, 4);
+    const std::vector<float> expected_axis1 = {
+       -1.0f, -4.0f,
+       -2.0f, -5.0f,
+        3.0f,  6.0f,
+    };
+    CHECK(axis1 == expected_axis1);
+    before_norm_sq = 0.0;
+    after_norm_sq = 0.0;
+    for (size_t index = 0; index < axis1.size(); ++index) {
+        before_norm_sq += double(axis1_before[index]) * axis1_before[index];
+        after_norm_sq += double(axis1[index]) * axis1[index];
+    }
+    CHECK(before_norm_sq == after_norm_sq);
+    CHECK(std::abs(axis1_stats.tensor_norm_sq - 91.0) < 1e-9);
+    CHECK(std::abs(axis1_stats.component_norm_sq - 46.0) < 1e-9);
+}
+
 static void test_quantization_residual_compensation() {
     const std::vector<float> direction = { 0.6f, 0.8f };
 
@@ -262,6 +324,54 @@ static void test_quantization_residual_compensation() {
     CHECK(std::abs(linear_coefficients[0] - 5.0) < 1e-6);
     CHECK(std::abs(linear_coefficients[1]) < 1e-6);
     CHECK(std::abs(linear_coefficients[2] - 10.0) < 1e-6);
+}
+
+static void test_target_relative_residual_compensation() {
+    const std::vector<float> direction = { 0.6f, 0.8f };
+    const std::vector<std::vector<float>> basis = { direction };
+    auto embedding = tensor_2d(2, 1);
+
+    // At scale one the intended target has no selected component, so the new
+    // target-relative measurement is exactly the legacy absolute measurement.
+    const std::vector<float> scale1_target = { 0.0f, 0.0f };
+    const std::vector<float> scale1_decoded = { 0.06f, 0.08f };
+    auto legacy_correction = scale1_target;
+    auto relative_correction = scale1_target;
+    const auto legacy_stats = llama_direction_remove_measured_subspace_f32(
+            legacy_correction.data(), scale1_decoded.data(), &embedding,
+            basis, 0.5f, 0, 2);
+    const auto relative_stats = llama_direction_remove_measured_subspace_difference_f32(
+            relative_correction.data(), scale1_decoded.data(), scale1_target.data(),
+            &embedding, basis, 0.5f, 0, 2);
+    CHECK(legacy_correction == relative_correction);
+    CHECK(legacy_stats.tensor_norm_sq == relative_stats.tensor_norm_sq);
+    CHECK(legacy_stats.component_norm_sq == relative_stats.component_norm_sq);
+
+    // At scale two the desired selected component is intentionally nonzero and
+    // reversed. Measure only the encode/decode error around that target, then
+    // apply a damped correction to a separate mutable F32 input.
+    const std::vector<float> source = { 3.0f, 4.0f };
+    auto intended = source;
+    const auto source_stats = llama_direction_orthogonalize_subspace_f32(
+            intended.data(), &embedding, basis, 2.0f, 0, 2);
+    CHECK(close(intended[0], -3.0f));
+    CHECK(close(intended[1], -4.0f));
+    const std::vector<float> decoded = {
+        intended[0] + 0.06f,
+        intended[1] + 0.08f,
+    };
+    auto corrected = intended;
+    std::vector<double> error_magnitudes;
+    const auto error_stats = llama_direction_remove_measured_subspace_difference_f32(
+            corrected.data(), decoded.data(), intended.data(), &embedding,
+            basis, 0.5f, 0, 2, &error_magnitudes);
+    CHECK(close(corrected[0], -3.03f));
+    CHECK(close(corrected[1], -4.04f));
+    CHECK(std::abs(error_stats.component_norm_sq - 0.01) < 1e-7);
+    CHECK(error_magnitudes.size() == 1);
+    CHECK(std::abs(error_magnitudes[0] - 0.1) < 1e-6);
+    CHECK(std::abs(llama_direction_retained_component_ratio(
+            source_stats, error_stats) - 0.02) < 1e-7);
 }
 
 static void test_subspace_projection() {
@@ -360,7 +470,9 @@ int main() {
     test_scale_and_thread_equivalence();
     test_measurement_only_and_zero_tensor();
     test_projection_invariants();
+    test_counterfactual_reflection();
     test_quantization_residual_compensation();
+    test_target_relative_residual_compensation();
     test_subspace_projection();
     test_principal_subspace();
     std::puts("direction projection tests passed");

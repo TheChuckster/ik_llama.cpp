@@ -556,11 +556,11 @@ extern "C" {
         void * orthogonalize_direction;       // pointer to one normalized vector<float> to project out. Can be null
         void * orthogonalize_directions;      // pointer to an orthonormal vector<vector<float>> basis. Can be null
         void * orthogonalize_pattern;         // regexes selecting tensors whose residual-write axis is projected. Can be null
-        float orthogonalize_scale;            // 1.0 removes the selected direction completely
+        float orthogonalize_scale;            // coefficient in (0, 2]; 1.0 removes and 2.0 reflects the selected subspace
         int32_t orthogonalize_expected_count; // fail before writing unless exactly this many tensors match; <= 0 disables the count check
         int32_t orthogonalize_quant_passes;    // maximum encode/decode correction passes, including the first; must be >= 1
-        float orthogonalize_quant_correction; // fraction of measured encode/decode residue subtracted before each retry
-        float orthogonalize_max_residual;     // maximum post-quant component retained relative to its source magnitude; < 0 disables the check
+        float orthogonalize_quant_correction; // fraction of measured target-relative encode/decode error subtracted before each retry
+        float orthogonalize_max_residual;     // maximum target-relative subspace error divided by source-component magnitude; < 0 disables
         struct quantize_user_data * user_data; // so we can pass extra data to the quantization functions
     } llama_model_quantize_params;
 

@@ -185,14 +185,14 @@ static void usage(const char * executable) {
     printf("  --orthogonalize-patch-existing: write only selected projected tensor payloads into an existing,\n");
     printf("      layout-compatible output model. Metadata and all non-selected payloads remain untouched.\n");
     printf("  --orthogonalize-pattern REGEXS: comma-separated tensor-name regexes to project. Required with a vector.\n");
-    printf("  --orthogonalize-scale F: projection strength in (0, 1], default 1.0.\n");
+    printf("  --orthogonalize-scale F: intervention coefficient in (0, 2], default 1.0; 1 removes and 2 reflects.\n");
     printf("  --orthogonalize-expected-count N: fail before writing unless exactly N tensors match.\n\n");
     printf("  --orthogonalize-quant-passes N: allow up to N encode/decode passes to compensate quantization residue.\n");
-    printf("      Includes the initial pass; range 1-64, default 1. Values above 1 require scale 1 and a residual limit.\n");
+    printf("      Includes the initial pass; range 1-64, default 1. Values above 1 require a residual limit.\n");
     printf("  --orthogonalize-quant-correction F: subtract this fraction of measured quantization residue per retry.\n");
     printf("      Must be finite and in (0, 1], default 0.25. The chosen value is logged in the preflight.\n");
-    printf("  --orthogonalize-max-residual F: fail if quantization retains more than this fraction of the source direction component.\n");
-    printf("      For example, 0.02 permits at most 2%% of the original component. Disabled by default.\n\n");
+    printf("  --orthogonalize-max-residual F: fail if target-relative subspace error exceeds this fraction of the source component.\n");
+    printf("      At scale 1 this is the legacy retained component; for example, 0.02 permits at most 2%%. Disabled by default.\n\n");
     printf("  --symmetric-q40  Use [-7:7] range for Q4_0 quantization (turns off imatrix)\n\n");
     printf("  --slow-iq2ks Use the original very slow IQ2_KS quantization method.\n\n");
     printf("  --fudge-factors type1=ff1,type2=ff2... Apply scale fudge factors during quantization as specified by type=fudge-factor.\n\n");
@@ -771,8 +771,8 @@ int main(int argc, char ** argv) {
             fprintf(stderr, "--orthogonalize-control-vector requires --orthogonalize-pattern\n");
             return 1;
         }
-        if (!std::isfinite(params.orthogonalize_scale) || params.orthogonalize_scale <= 0.0f || params.orthogonalize_scale > 1.0f) {
-            fprintf(stderr, "--orthogonalize-scale must be finite and in (0, 1]\n");
+        if (!std::isfinite(params.orthogonalize_scale) || params.orthogonalize_scale <= 0.0f || params.orthogonalize_scale > 2.0f) {
+            fprintf(stderr, "--orthogonalize-scale must be finite and in (0, 2]\n");
             return 1;
         }
         if (orthogonalize_subspace_rank < 0) {
@@ -795,10 +795,6 @@ int main(int argc, char ** argv) {
         }
         if (params.orthogonalize_quant_passes > 1 && params.orthogonalize_max_residual < 0.0f) {
             fprintf(stderr, "--orthogonalize-quant-passes above 1 requires --orthogonalize-max-residual\n");
-            return 1;
-        }
-        if (params.orthogonalize_quant_passes > 1 && params.orthogonalize_scale != 1.0f) {
-            fprintf(stderr, "--orthogonalize-quant-passes above 1 requires --orthogonalize-scale 1\n");
             return 1;
         }
         if (params.orthogonalize_patch_existing && !params.keep_split) {

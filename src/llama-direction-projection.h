@@ -22,17 +22,20 @@ inline double llama_direction_retained_component_ratio(
     return std::sqrt(post_quant.component_norm_sq / source.component_norm_sq);
 }
 
-// Measure the direction component in `measured` and remove it from `target`.
-// The buffers may alias. Keeping them separate lets the quantizer measure the
-// component reintroduced by an encode/decode pass and pre-compensate the
-// original projected F32 values without requantizing a lossy decode.
+// Measure the direction component in (`measured` - `reference`) and remove it
+// from `target`. A null reference measures `measured` directly. The target and
+// measured buffers may alias when reference is null. Keeping them separate
+// lets the quantizer measure the component reintroduced by an encode/decode
+// pass and pre-compensate the original transformed F32 values without
+// requantizing a lossy decode.
 //
 // Dequantization gives us a dense row-major F32 buffer regardless of the source
 // GGML type. axis 0 is used for token embeddings ([n_embd, n_token]); axis 1 is
 // used for linear maps whose output is the residual stream ([n_input, n_embd]).
-inline llama_direction_projection_stats llama_direction_remove_measured_component_f32(
+inline llama_direction_projection_stats llama_direction_remove_measured_component_difference_f32(
         float * target,
         const float * measured,
+        const float * reference,
         const ggml_tensor * tensor,
         const std::vector<float> & direction,
         float scale,
@@ -74,10 +77,13 @@ inline llama_direction_projection_stats llama_direction_remove_measured_componen
             for (int64_t row = row_begin; row < row_end; ++row) {
                 float * target_values = target + row * ne0;
                 const float * measured_values = measured + row * ne0;
+                const float * reference_values = reference ? reference + row * ne0 : nullptr;
                 double dot = 0.0;
                 for (int64_t col = 0; col < ne0; ++col) {
-                    dot += double(measured_values[col]) * direction[col];
-                    stats.tensor_norm_sq += double(measured_values[col]) * measured_values[col];
+                    const double value = double(measured_values[col]) -
+                            (reference_values ? reference_values[col] : 0.0);
+                    dot += value * direction[col];
+                    stats.tensor_norm_sq += value * value;
                 }
                 stats.component_norm_sq += dot * dot;
                 if (component_coefficients) {
@@ -105,6 +111,7 @@ inline llama_direction_projection_stats llama_direction_remove_measured_componen
     for (int64_t slice = 0; slice < n_slices; ++slice) {
         float * target_matrix = target + slice * ne0 * ne1;
         const float * measured_matrix = measured + slice * ne0 * ne1;
+        const float * reference_matrix = reference ? reference + slice * ne0 * ne1 : nullptr;
         std::vector<std::vector<double>> partial_coeffs(workers, std::vector<double>(ne0, 0.0));
         std::vector<double> partial_norms(workers, 0.0);
 
@@ -117,10 +124,13 @@ inline llama_direction_projection_stats llama_direction_remove_measured_componen
             double norm_sq = 0.0;
             for (int64_t row = row_begin; row < row_end; ++row) {
                 const float * values = measured_matrix + row * ne0;
+                const float * reference_values = reference_matrix ? reference_matrix + row * ne0 : nullptr;
                 const double dir = direction[row];
                 for (int64_t col = 0; col < ne0; ++col) {
-                    coeffs[col] += dir * values[col];
-                    norm_sq += double(values[col]) * values[col];
+                    const double value = double(values[col]) -
+                            (reference_values ? reference_values[col] : 0.0);
+                    coeffs[col] += dir * value;
+                    norm_sq += value * value;
                 }
             }
             partial_norms[worker] = norm_sq;
@@ -156,6 +166,20 @@ inline llama_direction_projection_stats llama_direction_remove_measured_componen
     return result;
 }
 
+inline llama_direction_projection_stats llama_direction_remove_measured_component_f32(
+        float * target,
+        const float * measured,
+        const ggml_tensor * tensor,
+        const std::vector<float> & direction,
+        float scale,
+        int axis,
+        int nthread,
+        std::vector<double> * component_coefficients = nullptr) {
+    return llama_direction_remove_measured_component_difference_f32(
+            target, measured, nullptr, tensor, direction, scale, axis, nthread,
+            component_coefficients);
+}
+
 // Remove scale * r r^T from a tensor's own residual-stream axis.
 inline llama_direction_projection_stats llama_direction_orthogonalize_f32(
         float * data,
@@ -173,9 +197,10 @@ inline llama_direction_projection_stats llama_direction_orthogonalize_f32(
 // coefficient arrays are reduced to one Euclidean magnitude per tensor row or
 // input column; the quantizer uses those magnitudes to retain the best encoded
 // embedding row across correction passes.
-inline llama_direction_projection_stats llama_direction_remove_measured_subspace_f32(
+inline llama_direction_projection_stats llama_direction_remove_measured_subspace_difference_f32(
         float * target,
         const float * measured,
+        const float * reference,
         const ggml_tensor * tensor,
         const std::vector<std::vector<float>> & basis,
         float scale,
@@ -195,8 +220,8 @@ inline llama_direction_projection_stats llama_direction_remove_measured_subspace
     bool first = true;
     for (const auto & direction : basis) {
         std::vector<double> coefficients;
-        const auto stats = llama_direction_remove_measured_component_f32(
-                target, measured, tensor, direction, scale, axis, nthread,
+        const auto stats = llama_direction_remove_measured_component_difference_f32(
+                target, measured, reference, tensor, direction, scale, axis, nthread,
                 component_magnitudes ? &coefficients : nullptr);
         if (first) {
             // If target and measured alias, later basis projections reduce the
@@ -220,6 +245,20 @@ inline llama_direction_projection_stats llama_direction_remove_measured_subspace
         }
     }
     return result;
+}
+
+inline llama_direction_projection_stats llama_direction_remove_measured_subspace_f32(
+        float * target,
+        const float * measured,
+        const ggml_tensor * tensor,
+        const std::vector<std::vector<float>> & basis,
+        float scale,
+        int axis,
+        int nthread,
+        std::vector<double> * component_magnitudes = nullptr) {
+    return llama_direction_remove_measured_subspace_difference_f32(
+            target, measured, nullptr, tensor, basis, scale, axis, nthread,
+            component_magnitudes);
 }
 
 inline llama_direction_projection_stats llama_direction_orthogonalize_subspace_f32(
