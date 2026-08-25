@@ -559,6 +559,7 @@ extern "C" {
         float orthogonalize_scale;            // 1.0 removes the selected direction completely
         int32_t orthogonalize_expected_count; // fail before writing unless exactly this many tensors match; <= 0 disables the count check
         int32_t orthogonalize_quant_passes;    // maximum encode/decode correction passes, including the first; must be >= 1
+        float orthogonalize_quant_correction; // fraction of measured encode/decode residue subtracted before each retry
         float orthogonalize_max_residual;     // maximum post-quant component retained relative to its source magnitude; < 0 disables the check
         struct quantize_user_data * user_data; // so we can pass extra data to the quantization functions
     } llama_model_quantize_params;

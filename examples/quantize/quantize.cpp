@@ -154,7 +154,7 @@ static bool try_parse_ftype(const std::string & ftype_str_in, llama_ftype & ftyp
 //
 [[noreturn]]
 static void usage(const char * executable) {
-    printf("usage: %s [--help] [--allow-requantize] [--leave-output-tensor] [--pure] [--imatrix] [--hide-imatrix] [--ignore-imatrix-rules] [--dry-run] [--include-weights] [--exclude-weights] [--output-tensor-type] [--token-embedding-type] [--per-layer-token-embedding-type] [--extra-output-tensor] [--fudge-factors] [--ffn-gate-inp-type] [--attn-q-type] [--attn-k-type] [--attn-v-type] [--attn-qkv-type] [--attn-output-type] [--ffn-gate-type] [--ffn-down-type] [--ffn-up-type] [--repack] [--repack-pattern] [--keep-pattern] [--keep-f32] [--keep-split] [--partial-requant] [--orthogonalize-control-vector] [--orthogonalize-layer-range] [--orthogonalize-subspace-rank] [--orthogonalize-patch-existing] [--orthogonalize-pattern] [--orthogonalize-scale] [--orthogonalize-expected-count] [--orthogonalize-quant-passes] [--orthogonalize-max-residual] [--override-kv] model-f32.gguf [model-quant.gguf] type [nthreads]\n\n", executable);
+    printf("usage: %s [--help] [--allow-requantize] [--leave-output-tensor] [--pure] [--imatrix] [--hide-imatrix] [--ignore-imatrix-rules] [--dry-run] [--include-weights] [--exclude-weights] [--output-tensor-type] [--token-embedding-type] [--per-layer-token-embedding-type] [--extra-output-tensor] [--fudge-factors] [--ffn-gate-inp-type] [--attn-q-type] [--attn-k-type] [--attn-v-type] [--attn-qkv-type] [--attn-output-type] [--ffn-gate-type] [--ffn-down-type] [--ffn-up-type] [--repack] [--repack-pattern] [--keep-pattern] [--keep-f32] [--keep-split] [--partial-requant] [--orthogonalize-control-vector] [--orthogonalize-layer-range] [--orthogonalize-subspace-rank] [--orthogonalize-patch-existing] [--orthogonalize-pattern] [--orthogonalize-scale] [--orthogonalize-expected-count] [--orthogonalize-quant-passes] [--orthogonalize-quant-correction] [--orthogonalize-max-residual] [--override-kv] model-f32.gguf [model-quant.gguf] type [nthreads]\n\n", executable);
     printf("  --allow-requantize: Allows requantizing tensors that have already been quantized. Warning: This can severely reduce quality compared to quantizing from 16bit or 32bit\n");
     printf("  --leave-output-tensor: Will leave output.weight un(re)quantized. Increases model size but may also increase quality, especially when requantizing\n");
     printf("  --pure: Disable k-quant mixtures and quantize all tensors to the same type\n");
@@ -188,7 +188,9 @@ static void usage(const char * executable) {
     printf("  --orthogonalize-scale F: projection strength in (0, 1], default 1.0.\n");
     printf("  --orthogonalize-expected-count N: fail before writing unless exactly N tensors match.\n\n");
     printf("  --orthogonalize-quant-passes N: allow up to N encode/decode passes to compensate quantization residue.\n");
-    printf("      Includes the initial pass; range 1-16, default 1. Values above 1 require scale 1 and a residual limit.\n");
+    printf("      Includes the initial pass; range 1-64, default 1. Values above 1 require scale 1 and a residual limit.\n");
+    printf("  --orthogonalize-quant-correction F: subtract this fraction of measured quantization residue per retry.\n");
+    printf("      Must be finite and in (0, 1], default 0.25. The chosen value is logged in the preflight.\n");
     printf("  --orthogonalize-max-residual F: fail if quantization retains more than this fraction of the source direction component.\n");
     printf("      For example, 0.02 permits at most 2%% of the original component. Disabled by default.\n\n");
     printf("  --symmetric-q40  Use [-7:7] range for Q4_0 quantization (turns off imatrix)\n\n");
@@ -535,6 +537,7 @@ int main(int argc, char ** argv) {
     int orthogonalize_layer_start = -1;
     int orthogonalize_layer_end = -1;
     int orthogonalize_subspace_rank = 0;
+    bool orthogonalize_quant_correction_set = false;
 
     std::unordered_map<ggml_type, float> fudge_factors;
 
@@ -612,6 +615,13 @@ int main(int argc, char ** argv) {
         } else if (strcmp(argv[arg_idx], "--orthogonalize-quant-passes") == 0) {
             if (arg_idx < argc-1) {
                 params.orthogonalize_quant_passes = std::stoi(argv[++arg_idx]);
+            } else {
+                usage(argv[0]);
+            }
+        } else if (strcmp(argv[arg_idx], "--orthogonalize-quant-correction") == 0) {
+            if (arg_idx < argc-1) {
+                params.orthogonalize_quant_correction = std::stof(argv[++arg_idx]);
+                orthogonalize_quant_correction_set = true;
             } else {
                 usage(argv[0]);
             }
@@ -773,8 +783,14 @@ int main(int argc, char ** argv) {
             fprintf(stderr, "--orthogonalize-max-residual must be finite and <= 1\n");
             return 1;
         }
-        if (params.orthogonalize_quant_passes < 1 || params.orthogonalize_quant_passes > 16) {
-            fprintf(stderr, "--orthogonalize-quant-passes must be in [1, 16]\n");
+        if (params.orthogonalize_quant_passes < 1 || params.orthogonalize_quant_passes > 64) {
+            fprintf(stderr, "--orthogonalize-quant-passes must be in [1, 64]\n");
+            return 1;
+        }
+        if (!std::isfinite(params.orthogonalize_quant_correction) ||
+                params.orthogonalize_quant_correction <= 0.0f ||
+                params.orthogonalize_quant_correction > 1.0f) {
+            fprintf(stderr, "--orthogonalize-quant-correction must be finite and in (0, 1]\n");
             return 1;
         }
         if (params.orthogonalize_quant_passes > 1 && params.orthogonalize_max_residual < 0.0f) {
@@ -802,6 +818,7 @@ int main(int argc, char ** argv) {
         params.orthogonalize_pattern = &orthogonalize_patterns;
     } else if (!orthogonalize_patterns.empty() || params.orthogonalize_expected_count > 0 ||
                params.orthogonalize_quant_passes != 1 ||
+               orthogonalize_quant_correction_set ||
                params.orthogonalize_max_residual >= 0.0f ||
                params.orthogonalize_patch_existing ||
                orthogonalize_subspace_rank != 0 ||

@@ -1268,8 +1268,13 @@ static void llama_model_quantize_internal(const std::string & fname_inp, const s
                 params->orthogonalize_max_residual > 1.0f) {
             throw std::runtime_error("orthogonalize_max_residual must be finite and <= 1");
         }
-        if (params->orthogonalize_quant_passes < 1 || params->orthogonalize_quant_passes > 16) {
-            throw std::runtime_error("orthogonalize_quant_passes must be in [1, 16]");
+        if (params->orthogonalize_quant_passes < 1 || params->orthogonalize_quant_passes > 64) {
+            throw std::runtime_error("orthogonalize_quant_passes must be in [1, 64]");
+        }
+        if (!std::isfinite(params->orthogonalize_quant_correction) ||
+                params->orthogonalize_quant_correction <= 0.0f ||
+                params->orthogonalize_quant_correction > 1.0f) {
+            throw std::runtime_error("orthogonalize_quant_correction must be finite and in (0, 1]");
         }
         if (params->orthogonalize_quant_passes > 1 && params->orthogonalize_max_residual < 0.0f) {
             throw std::runtime_error("orthogonalize_quant_passes above 1 requires a residual limit");
@@ -1370,13 +1375,15 @@ static void llama_model_quantize_internal(const std::string & fname_inp, const s
                     "orthogonalization matched %zu tensors, expected exactly %d",
                     orthogonalize_axes.size(), params->orthogonalize_expected_count));
         }
-        LLAMA_LOG_INFO("%s: orthogonalization preflight matched %zu tensors; selected-F32=%zu; basis-rank=%zu; scale %.4f; quant-passes %d; patch-existing=%s; input files remain read-only\n",
+        LLAMA_LOG_INFO("%s: orthogonalization preflight matched %zu tensors; selected-F32=%zu; basis-rank=%zu; scale %.4f; quant-passes %d; correction %.4f; patch-existing=%s; input files remain read-only\n",
                 __func__, orthogonalize_axes.size(), orthogonalize_f32_count,
                 orthogonalize_directions->size(),
                 params->orthogonalize_scale, params->orthogonalize_quant_passes,
+                params->orthogonalize_quant_correction,
                 params->orthogonalize_patch_existing ? "yes" : "no");
     } else if (params->orthogonalize_expected_count > 0 ||
             params->orthogonalize_quant_passes != 1 ||
+            params->orthogonalize_quant_correction != 0.25f ||
             params->orthogonalize_max_residual >= 0.0f ||
             params->orthogonalize_patch_existing) {
         throw std::runtime_error("orthogonalization controls require a direction and pattern");
@@ -2110,7 +2117,8 @@ static void llama_model_quantize_internal(const std::string & fname_inp, const s
                         // A damped step explores the discontinuous quantized
                         // code space without the two-point oscillation caused
                         // by subtracting the full decoded residue.
-                        const float correction_scale = pass < params->orthogonalize_quant_passes ? 0.25f : 0.0f;
+                        const float correction_scale = pass < params->orthogonalize_quant_passes
+                                ? params->orthogonalize_quant_correction : 0.0f;
                         const auto post_stats = llama_direction_remove_measured_subspace_f32(
                                 f32_data, (const float *) post_quant_buf.data(), tensor,
                                 *orthogonalize_directions, correction_scale,

@@ -8020,6 +8020,7 @@ struct llama_model_quantize_params llama_model_quantize_default_params() {
         /*.orthogonalize_scale            =*/ 1.0f,
         /*.orthogonalize_expected_count   =*/ 0,
         /*.orthogonalize_quant_passes      =*/ 1,
+        /*.orthogonalize_quant_correction =*/ 0.25f,
         /*.orthogonalize_max_residual     =*/ -1.0f,
         /*.user_data                      =*/ nullptr,
     };

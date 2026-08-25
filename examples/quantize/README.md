@@ -52,6 +52,7 @@ F32 immediately before the selected tensors are encoded:
     --orthogonalize-scale 1.0 \
     --orthogonalize-expected-count 33 \
     --orthogonalize-quant-passes 16 \
+    --orthogonalize-quant-correction 0.25 \
     --orthogonalize-max-residual 0.02 \
     ./model-input.gguf ./model-projected.gguf Q5_K
 ```
@@ -65,7 +66,10 @@ source component; `0.02` means at most 2% retained. Q5 encoding can reintroduce
 more than that in a single pass. `--orthogonalize-quant-passes` permits bounded
 encode/decode correction passes: each retry subtracts a damped share of only the
 measured residue from the original projected F32 buffer, never from a lossy
-decoded buffer. For axis-0 embedding tensors, independently encoded rows keep
+decoded buffer. The share defaults to `0.25` and can be pinned with
+`--orthogonalize-quant-correction`; the preflight logs it. Up to 64 passes are
+accepted so a caller can set an explicit bounded numerical protocol. For axis-0
+embedding tensors, independently encoded rows keep
 their lowest-residual result across the bounded passes; axis-1 matrices keep the
 best whole-tensor pass because their measured columns cross quantization rows.
 More than one pass requires full (`1.0`) projection and an enabled residual

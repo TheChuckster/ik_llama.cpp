@@ -105,8 +105,20 @@ def main():
             "--orthogonalize-scale", "1.0",
             "--orthogonalize-expected-count", "1",
             "--orthogonalize-quant-passes", "16",
+            "--orthogonalize-quant-correction", "0.25",
             "--orthogonalize-max-residual", "0.10",
         ]
+        invalid_correction = subprocess.run(
+            common + ["--orthogonalize-quant-correction", "0",
+                      str(args.model), str(output_prefix) + ".gguf", "Q8_0", "4"],
+            capture_output=True, text=True)
+        if (invalid_correction.returncode == 0 or
+                "orthogonalize-quant-correction must be finite and in (0, 1]" not in
+                invalid_correction.stdout + invalid_correction.stderr):
+            raise SystemExit("FAIL: invalid correction fraction did not fail closed")
+        if sha256(candidate) != pristine_candidate_hash:
+            raise SystemExit("FAIL: invalid correction fraction changed the candidate")
+
         mismatch = subprocess.run(
             common + [str(args.model), str(output_prefix) + ".gguf", "Q5_K", "4"],
             capture_output=True, text=True)
@@ -118,7 +130,9 @@ def main():
 
         dry = subprocess.run(
             common + ["--dry-run", str(args.model), str(output_prefix) + ".gguf", "Q8_0", "4"],
-            check=True, capture_output=True, text=True)
+            capture_output=True, text=True)
+        if dry.returncode != 0:
+            raise SystemExit("FAIL: dry run failed:\n" + dry.stdout + dry.stderr)
         if "patch-existing validated" not in dry.stdout + dry.stderr:
             raise SystemExit("FAIL: dry run did not validate existing output")
         if sha256(candidate) != pristine_candidate_hash:
@@ -126,7 +140,9 @@ def main():
 
         actual = subprocess.run(
             common + [str(args.model), str(output_prefix) + ".gguf", "Q8_0", "4"],
-            check=True, capture_output=True, text=True)
+            capture_output=True, text=True)
+        if actual.returncode != 0:
+            raise SystemExit("FAIL: actual patch failed:\n" + actual.stdout + actual.stderr)
         log = actual.stdout + actual.stderr
         if log.count("patched-existing shard=") != 1:
             raise SystemExit("FAIL: actual run did not patch exactly one payload")
