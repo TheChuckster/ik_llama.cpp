@@ -201,6 +201,7 @@ llama_build_and_test(
     peg-parser/tests.h
 )
 llama_build_and_test(test-regex-partial.cpp)
+llama_build_and_test(test-common-sha256.cpp)
 
 llama_build_and_test(test-iq4-ks-kt-decode.cpp)
 target_include_directories(test-iq4-ks-kt-decode PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src)
@@ -228,6 +229,12 @@ target_include_directories(test-control-vector-projection PRIVATE ${PROJECT_SOUR
 target_link_libraries(test-control-vector-projection PRIVATE ggml)
 add_test(NAME test-control-vector-projection COMMAND $<TARGET_FILE:test-control-vector-projection>)
 set_property(TEST test-control-vector-projection PROPERTY LABELS main)
+
+add_executable(test-control-vector-affine-subspace test-control-vector-affine-subspace.cpp)
+target_include_directories(test-control-vector-affine-subspace PRIVATE ${PROJECT_SOURCE_DIR}/src)
+target_link_libraries(test-control-vector-affine-subspace PRIVATE ggml)
+add_test(NAME test-control-vector-affine-subspace COMMAND $<TARGET_FILE:test-control-vector-affine-subspace>)
+set_property(TEST test-control-vector-affine-subspace PROPERTY LABELS main)
 
 # This fixture-backed state test is run explicitly with a tiny model path.
 add_executable(test-control-vector-state test-control-vector-state.cpp)

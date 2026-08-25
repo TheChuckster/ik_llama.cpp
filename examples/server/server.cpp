@@ -1692,6 +1692,18 @@ int main(int argc, char ** argv) {
     // Control vector handlers
     const auto handle_control_vectors_list = [&](const httplib::Request & req, httplib::Response & res) {
         json result = json::array();
+        if (!ctx_server.params_base.control_vector_affine_subspace.empty()) {
+            result.push_back({
+                {"id", -1},
+                {"path", ctx_server.params_base.control_vector_affine_subspace},
+                {"layer", ctx_server.params_base.control_vector_affine_layer},
+                {"rank", ctx_server.params_base.control_vector_affine_rank},
+                {"alpha", ctx_server.params_base.control_vector_affine_alpha},
+                {"applied", true},
+                {"type", "affine_subspace"},
+                {"read_only", true},
+            });
+        }
         if (!ctx_server.params_base.control_vector_projection.empty()) {
             result.push_back({
                 {"id", -1},
@@ -1733,8 +1745,9 @@ int main(int argc, char ** argv) {
     };
 
     const auto handle_control_vectors_load = [&](const httplib::Request & req, httplib::Response & res) {
-        if (!ctx_server.params_base.control_vector_projection.empty()) {
-            res.set_content(json{{ "success", false }, { "error", "Hot control-vector mutation is disabled while a startup projection is active" }}.dump(), "application/json");
+        if (!ctx_server.params_base.control_vector_projection.empty()
+                || !ctx_server.params_base.control_vector_affine_subspace.empty()) {
+            res.set_content(json{{ "success", false }, { "error", "Hot control-vector mutation is disabled while an immutable startup edit is active" }}.dump(), "application/json");
             res.status = 409;
             return;
         }
@@ -1755,8 +1768,9 @@ int main(int argc, char ** argv) {
     };
 
     const auto handle_control_vectors_unload = [&](const httplib::Request & req, httplib::Response & res) {
-        if (!ctx_server.params_base.control_vector_projection.empty()) {
-            res.set_content(json{{ "success", false }, { "error", "Hot control-vector mutation is disabled while a startup projection is active" }}.dump(), "application/json");
+        if (!ctx_server.params_base.control_vector_projection.empty()
+                || !ctx_server.params_base.control_vector_affine_subspace.empty()) {
+            res.set_content(json{{ "success", false }, { "error", "Hot control-vector mutation is disabled while an immutable startup edit is active" }}.dump(), "application/json");
             res.status = 409;
             return;
         }
@@ -1777,8 +1791,9 @@ int main(int argc, char ** argv) {
     };
 
     const auto handle_control_vectors_apply = [&](const httplib::Request & req, httplib::Response & res) {
-        if (!ctx_server.params_base.control_vector_projection.empty()) {
-            res.set_content(json{{ "success", false }, { "error", "Hot control-vector mutation is disabled while a startup projection is active" }}.dump(), "application/json");
+        if (!ctx_server.params_base.control_vector_projection.empty()
+                || !ctx_server.params_base.control_vector_affine_subspace.empty()) {
+            res.set_content(json{{ "success", false }, { "error", "Hot control-vector mutation is disabled while an immutable startup edit is active" }}.dump(), "application/json");
             res.status = 409;
             return;
         }

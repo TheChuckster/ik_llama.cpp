@@ -808,6 +808,20 @@ extern "C" {
                          int32_t   il_start,
                          int32_t   il_end);
 
+    // Apply one immutable affine subspace at one residual layer. The basis is
+    // rank contiguous unit rows of width n_embd. The operation projects every
+    // token out of their orthonormal span, then adds offset. Passing both basis
+    // and offset as NULL clears only the affine subspace.
+    LLAMA_API int32_t llama_control_vector_affine_subspace_apply(
+            struct llama_context * lctx,
+                     const float * basis,
+                          size_t   basis_len,
+                     const float * offset,
+                          size_t   offset_len,
+                         int32_t   n_embd,
+                         int32_t   rank,
+                         int32_t   layer);
+
     //
     // KV cache
     //

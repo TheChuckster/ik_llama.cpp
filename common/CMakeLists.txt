@@ -58,6 +58,8 @@ add_library(${TARGET} STATIC
     chat-diff-analyzer.cpp
 	chat-peg-parser.cpp
     chat-peg-parser.h
+    common-sha256.c
+    common-sha256.h
     common.cpp
     sampling.h
     sampling.cpp

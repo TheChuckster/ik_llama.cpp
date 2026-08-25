@@ -9478,6 +9478,11 @@ int32_t llama_control_vector_apply(struct llama_context * lctx, const float * da
         return 0;
     }
 
+    if (lctx->cvec.affine_subspace.active()) {
+        LLAMA_LOG_ERROR("%s: additive control vectors conflict with the active affine subspace\n", __func__);
+        return 1;
+    }
+
     if (n_embd != (int) model.hparams.n_embd) {
         LLAMA_LOG_ERROR("%s: control vector n_embd does not match model\n", __func__);
         return 1;
@@ -9511,6 +9516,11 @@ int32_t llama_control_vector_projection_apply(struct llama_context * lctx, const
         bank.layer_start = -1;
         bank.layer_end   = -1;
         return 0;
+    }
+
+    if (lctx->cvec.affine_subspace.active()) {
+        LLAMA_LOG_ERROR("%s: rank-one projection conflicts with the active affine subspace\n", __func__);
+        return 1;
     }
 
     if (n_embd != (int) model.hparams.n_embd) {
@@ -9563,6 +9573,120 @@ int32_t llama_control_vector_projection_apply(struct llama_context * lctx, const
         }
     }
 
+    return 0;
+}
+
+static bool llama_control_vector_affine_subspace_init(
+        llama_control_vector_affine_subspace_bank & bank,
+        const llama_model & model,
+        int32_t rank,
+        int32_t layer) {
+    GGML_ASSERT(bank.bases.empty());
+    GGML_ASSERT(bank.offsets.empty());
+    GGML_ASSERT(bank.ctxs.empty());
+    GGML_ASSERT(bank.bufs.empty());
+
+    ggml_init_params params = {
+        /*.mem_size   =*/ 2 * ggml_tensor_overhead(),
+        /*.mem_buffer =*/ nullptr,
+        /*.no_alloc   =*/ true,
+    };
+    ggml_context * ctx = ggml_init(params);
+    if (ctx == nullptr) {
+        LLAMA_LOG_ERROR("%s: failed to allocate affine-subspace context\n", __func__);
+        return false;
+    }
+    ggml_tensor * basis = ggml_new_tensor_2d(
+        ctx, GGML_TYPE_F32, model.hparams.n_embd, rank);
+    ggml_tensor * offset = ggml_new_tensor_1d(
+        ctx, GGML_TYPE_F32, model.hparams.n_embd);
+    ggml_backend_buffer_t buffer = ggml_backend_alloc_ctx_tensors_from_buft(
+        ctx, model.buft_layer[layer].buft);
+    if (buffer == nullptr) {
+        LLAMA_LOG_ERROR("%s: failed to allocate affine-subspace buffer\n", __func__);
+        ggml_free(ctx);
+        return false;
+    }
+    ggml_backend_buffer_clear(buffer, 0);
+
+    bank.bases.resize(model.hparams.n_layer, nullptr);
+    bank.offsets.resize(model.hparams.n_layer, nullptr);
+    bank.bases[layer] = basis;
+    bank.offsets[layer] = offset;
+    bank.ctxs.push_back(ctx);
+    bank.bufs.push_back(buffer);
+    bank.rank = rank;
+    return true;
+}
+
+int32_t llama_control_vector_affine_subspace_apply(
+        struct llama_context * lctx,
+        const float * basis,
+        size_t basis_len,
+        const float * offset,
+        size_t offset_len,
+        int32_t n_embd,
+        int32_t rank,
+        int32_t layer) {
+    llama_control_vector_affine_subspace_bank & bank = lctx->cvec.affine_subspace;
+    const llama_model & model = lctx->model;
+
+    if (basis == nullptr && offset == nullptr) {
+        bank.layer = -1;
+        return 0;
+    }
+    if (basis == nullptr || offset == nullptr) {
+        LLAMA_LOG_ERROR("%s: basis and offset must both be present\n", __func__);
+        return 1;
+    }
+    if (lctx->cvec.additive.layer_start >= 0 || lctx->cvec.projection.layer_start >= 0) {
+        LLAMA_LOG_ERROR("%s: affine subspace conflicts with active legacy control vectors\n", __func__);
+        return 1;
+    }
+    if (n_embd != (int32_t) model.hparams.n_embd) {
+        LLAMA_LOG_ERROR("%s: affine-subspace n_embd does not match model\n", __func__);
+        return 1;
+    }
+    if (rank < 1 || rank > 64) {
+        LLAMA_LOG_ERROR("%s: affine-subspace rank %d is outside 1..64\n", __func__, rank);
+        return 1;
+    }
+    if (layer < 1 || layer >= (int32_t) model.hparams.n_layer) {
+        LLAMA_LOG_ERROR("%s: invalid affine-subspace layer %d for %u layers\n",
+                __func__, layer, model.hparams.n_layer);
+        return 1;
+    }
+    const size_t expected_basis_len = (size_t) n_embd * rank;
+    if (basis_len != expected_basis_len || offset_len != (size_t) n_embd) {
+        LLAMA_LOG_ERROR("%s: affine-subspace tensor lengths are invalid\n", __func__);
+        return 1;
+    }
+    if (!llama_control_vector_is_orthonormal_f32(
+            basis, (size_t) n_embd, (size_t) rank)) {
+        LLAMA_LOG_ERROR("%s: affine-subspace basis is not finite and orthonormal\n", __func__);
+        return 1;
+    }
+    if (!llama_control_vector_offset_in_span_f32(
+            basis, offset, (size_t) n_embd, (size_t) rank)) {
+        LLAMA_LOG_ERROR("%s: affine-subspace offset is non-finite or outside the basis span\n", __func__);
+        return 1;
+    }
+
+    if (bank.bases.empty()) {
+        if (!llama_control_vector_affine_subspace_init(bank, model, rank, layer)) {
+            return 1;
+        }
+    } else if (bank.rank != rank || (size_t) layer >= bank.bases.size()
+            || bank.bases[layer] == nullptr || bank.offsets[layer] == nullptr) {
+        LLAMA_LOG_ERROR("%s: an allocated affine subspace cannot change rank or layer\n", __func__);
+        return 1;
+    }
+
+    ggml_backend_tensor_set(
+        bank.bases[layer], basis, 0, basis_len * sizeof(float));
+    ggml_backend_tensor_set(
+        bank.offsets[layer], offset, 0, offset_len * sizeof(float));
+    bank.layer = layer;
     return 0;
 }
 

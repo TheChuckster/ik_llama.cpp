@@ -312,11 +312,50 @@ struct llama_control_vector_bank {
     }
 };
 
+struct llama_control_vector_affine_subspace_bank {
+    std::vector<struct ggml_tensor *> bases;   // per layer, shape [n_embd, rank]
+    std::vector<struct ggml_tensor *> offsets; // per layer, shape [n_embd]
+    std::vector<struct ggml_context *> ctxs;
+    std::vector<ggml_backend_buffer_t> bufs;
+
+    int32_t layer = -1;
+    int32_t rank  = -1;
+
+    bool active() const {
+        return layer >= 1 && rank >= 1;
+    }
+
+    struct ggml_tensor * apply_to(
+            struct ggml_context * ctx,
+            struct ggml_tensor * cur,
+            int il) const {
+        if (!active() || il != layer || (size_t) il >= bases.size()
+                || bases[il] == nullptr || offsets[il] == nullptr) {
+            return cur;
+        }
+        cur = llama_control_vector_project_subspace(ctx, cur, bases[il], rank);
+        return ggml_add(ctx, cur, offsets[il]);
+    }
+
+    ~llama_control_vector_affine_subspace_bank() {
+        for (struct ggml_context * ctx : ctxs) {
+            ggml_free(ctx);
+        }
+        for (ggml_backend_buffer_t buf : bufs) {
+            ggml_backend_buffer_free(buf);
+        }
+    }
+};
+
 struct llama_control_vector {
     llama_control_vector_bank additive;
     llama_control_vector_bank projection;
+    llama_control_vector_affine_subspace_bank affine_subspace;
 
     struct ggml_tensor * apply_to(struct ggml_context * ctx, struct ggml_tensor * cur, int il) const {
+        if (affine_subspace.active()) {
+            return affine_subspace.apply_to(ctx, cur, il);
+        }
         if (ggml_tensor * layer_direction = projection.tensor_for(il)) {
             cur = llama_control_vector_project(ctx, cur, layer_direction);
         }

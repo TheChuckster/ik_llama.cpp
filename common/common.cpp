@@ -10,9 +10,11 @@
 #endif
 
 #include "common.h"
+#include "common-sha256.h"
 // Change JSON_ASSERT from assert() to GGML_ASSERT:
 #define JSON_ASSERT GGML_ASSERT
 #include "llama-vocab.h"
+#include "llama-control-vector.h"
 #include "llama.h"
 #include "chat.h"
 #include "json-schema-to-grammar.h"
@@ -28,6 +30,7 @@
 #include <fstream>
 #include <iostream>
 #include <iterator>
+#include <limits>
 #include <regex>
 #include <sstream>
 #include <string>
@@ -733,6 +736,15 @@ bool gpt_params_parse_ex(int argc, char ** argv, gpt_params & params) {
 
     if (params.prompt_cache_all && (params.interactive || params.interactive_first)) {
         throw std::invalid_argument("error: --prompt-cache-all not supported in interactive mode yet\n");
+    }
+
+    if (!params.control_vector_affine_subspace.empty()
+            && (!params.control_vectors.empty()
+                || !params.control_vector_projection.empty()
+                || params.control_vector_layer_range_explicit)) {
+        throw std::invalid_argument(
+            "error: --control-vector-affine-subspace is mutually exclusive with "
+            "all other control-vector and layer-range options");
     }
 
     gpt_params_handle_model_default(params);
@@ -1738,11 +1750,21 @@ bool gpt_params_find_arg(int argc, char ** argv, const std::string & arg, gpt_pa
         params.control_vector_projection = argv[i];
         return true;
     }
+    if (arg == "--control-vector-affine-subspace") {
+        CHECK_ARG
+        if (!params.control_vector_affine_subspace.empty()) {
+            throw std::invalid_argument(
+                "--control-vector-affine-subspace may only be specified once");
+        }
+        params.control_vector_affine_subspace = argv[i];
+        return true;
+    }
     if (arg == "--control-vector-layer-range") {
         CHECK_ARG
         params.control_vector_layer_start = std::stoi(argv[i]);
         CHECK_ARG
         params.control_vector_layer_end = std::stoi(argv[i]);
+        params.control_vector_layer_range_explicit = true;
         return true;
     }
     if (arg == "--mmproj") {
@@ -3385,6 +3407,9 @@ void gpt_params_print_usage(int /*argc*/, char ** argv, const gpt_params & param
     options.push_back({ "*",           "       --control-vector-projection FNAME",
                                                                         "project out one unit control vector before additive control vectors\n"
                                                                         "(for affine concept editing; may be specified once)" });
+    options.push_back({ "*",           "       --control-vector-affine-subspace FNAME",
+                                                                        "apply one immutable self-contained orthonormal basis and offset\n"
+                                                                        "at its artifact-fixed layer (startup only; exclusive)" });
     options.push_back({ "*",           "       --control-vector-layer-range START END",
                                                                         "layer range to apply additive and projection control vectors to, start and end inclusive" });
     options.push_back({ "*",           "-m,    --model FNAME",          "model path (default: models/$filename with filename from --hf-file\n"
@@ -4110,6 +4135,28 @@ struct llama_init_result llama_init_from_gpt_params(gpt_params & params) {
 
     for (auto [op, on_off] : params.offload_policy) {
         llama_set_offload_policy(lctx, op, on_off);
+    }
+
+    if (!params.control_vector_affine_subspace.empty()) {
+        const auto affine = llama_control_vector_affine_subspace_load(
+            params.control_vector_affine_subspace, llama_n_layer(model) - 1);
+        if (affine.n_embd == -1) {
+            llama_free(lctx);
+            llama_free_model(model);
+            return iparams;
+        }
+        if (llama_control_vector_affine_subspace_apply(
+                lctx,
+                affine.basis.data(), affine.basis.size(),
+                affine.offset.data(), affine.offset.size(),
+                affine.n_embd, affine.rank, affine.layer) != 0) {
+            llama_free(lctx);
+            llama_free_model(model);
+            return iparams;
+        }
+        params.control_vector_affine_layer = affine.layer;
+        params.control_vector_affine_rank = affine.rank;
+        params.control_vector_affine_alpha = affine.alpha;
     }
 
     if (!params.control_vector_projection.empty()) {
@@ -5289,6 +5336,191 @@ llama_control_vector_data llama_control_vector_load(
         result.layers_present.clear();
     }
 
+    return result;
+}
+
+static int common_gguf_required_unique_key(
+        const gguf_context * context,
+        const char * key,
+        gguf_type expected_type) {
+    int found = -1;
+    int count = 0;
+    for (int index = 0; index < gguf_get_n_kv(context); ++index) {
+        if (std::strcmp(gguf_get_key(context, index), key) == 0) {
+            found = index;
+            ++count;
+        }
+    }
+    if (count != 1 || gguf_get_kv_type(context, found) != expected_type) {
+        fprintf(stderr, "%s: required unique metadata key %s has wrong count or type\n",
+                __func__, key);
+        return -1;
+    }
+    return found;
+}
+
+static bool common_is_lower_sha256(const char * value) {
+    if (value == nullptr || std::strlen(value) != 64) {
+        return false;
+    }
+    return std::all_of(value, value + 64, [](unsigned char byte) {
+        return (byte >= '0' && byte <= '9') || (byte >= 'a' && byte <= 'f');
+    });
+}
+
+static std::string common_sha256_hex(const void * data, size_t size) {
+    unsigned char digest[COMMON_SHA256_DIGEST_SIZE];
+    common_sha256_hash(
+        digest, static_cast<const unsigned char *>(data), size);
+    static const char hexadecimal[] = "0123456789abcdef";
+    std::string result(COMMON_SHA256_DIGEST_SIZE * 2, '0');
+    for (size_t index = 0; index < COMMON_SHA256_DIGEST_SIZE; ++index) {
+        result[index * 2] = hexadecimal[digest[index] >> 4];
+        result[index * 2 + 1] = hexadecimal[digest[index] & 0x0f];
+    }
+    return result;
+}
+
+llama_control_vector_affine_subspace_data
+llama_control_vector_affine_subspace_load(
+        const std::string & fname,
+        int32_t max_layer) {
+    llama_control_vector_affine_subspace_data result;
+    ggml_context * context = nullptr;
+    gguf_init_params params = {
+        /* .no_alloc = */ false,
+        /* .ctx      = */ &context,
+    };
+    gguf_context * gguf = gguf_init_from_file(fname.c_str(), params);
+    if (gguf == nullptr || context == nullptr) {
+        fprintf(stderr, "%s: failed to load affine-subspace file from %s\n",
+                __func__, fname.c_str());
+        if (gguf != nullptr) {
+            gguf_free(gguf);
+        }
+        if (context != nullptr) {
+            ggml_free(context);
+        }
+        return result;
+    }
+
+    bool valid = false;
+    do {
+        const int architecture_key = common_gguf_required_unique_key(
+            gguf, "general.architecture", GGUF_TYPE_STRING);
+        const int model_key = common_gguf_required_unique_key(
+            gguf, "controlvectorsubspace.model_hint", GGUF_TYPE_STRING);
+        const int method_key = common_gguf_required_unique_key(
+            gguf, "controlvectorsubspace.method", GGUF_TYPE_STRING);
+        const int layer_key = common_gguf_required_unique_key(
+            gguf, "controlvectorsubspace.layer", GGUF_TYPE_UINT32);
+        const int rank_key = common_gguf_required_unique_key(
+            gguf, "controlvectorsubspace.rank", GGUF_TYPE_UINT32);
+        const int alpha_key = common_gguf_required_unique_key(
+            gguf, "controlvectorsubspace.alpha", GGUF_TYPE_FLOAT32);
+        const int capture_hash_key = common_gguf_required_unique_key(
+            gguf, "controlvectorsubspace.source_activation_sha256", GGUF_TYPE_STRING);
+        const int basis_hash_key = common_gguf_required_unique_key(
+            gguf, "controlvectorsubspace.source_basis_sha256", GGUF_TYPE_STRING);
+        const int offset_hash_key = common_gguf_required_unique_key(
+            gguf, "controlvectorsubspace.offset_payload_sha256", GGUF_TYPE_STRING);
+        const int tensor_count_key = common_gguf_required_unique_key(
+            gguf, "controlvectorsubspace.tensor_count", GGUF_TYPE_UINT32);
+        if (architecture_key < 0 || model_key < 0 || method_key < 0
+                || layer_key < 0 || rank_key < 0 || alpha_key < 0
+                || capture_hash_key < 0 || basis_hash_key < 0
+                || offset_hash_key < 0 || tensor_count_key < 0) {
+            break;
+        }
+
+        const uint32_t layer = gguf_get_val_u32(gguf, layer_key);
+        const uint32_t rank = gguf_get_val_u32(gguf, rank_key);
+        const float alpha = gguf_get_val_f32(gguf, alpha_key);
+        const char * capture_hash = gguf_get_val_str(gguf, capture_hash_key);
+        const char * basis_hash = gguf_get_val_str(gguf, basis_hash_key);
+        const char * offset_hash = gguf_get_val_str(gguf, offset_hash_key);
+        if (std::strcmp(gguf_get_val_str(gguf, architecture_key),
+                        "controlvectorsubspace") != 0
+                || std::strcmp(gguf_get_val_str(gguf, model_key), "kimi-k3") != 0
+                || std::strcmp(gguf_get_val_str(gguf, method_key),
+                               "k3-v9-q5-rank7-affine-v1") != 0
+                || layer < 1 || layer > INT32_MAX
+                || (max_layer >= 0 && layer > (uint32_t) max_layer)
+                || rank < 1 || rank > 64
+                || !std::isfinite(alpha)
+                || !common_is_lower_sha256(capture_hash)
+                || !common_is_lower_sha256(basis_hash)
+                || !common_is_lower_sha256(offset_hash)
+                || gguf_get_val_u32(gguf, tensor_count_key) != 2
+                || gguf_get_n_tensors(gguf) != 2) {
+            fprintf(stderr, "%s: invalid affine-subspace metadata in %s\n",
+                    __func__, fname.c_str());
+            break;
+        }
+
+        const std::string basis_name = "basis." + std::to_string(layer);
+        const std::string offset_name = "offset." + std::to_string(layer);
+        std::set<std::string> tensor_names;
+        for (int index = 0; index < gguf_get_n_tensors(gguf); ++index) {
+            tensor_names.emplace(gguf_get_tensor_name(gguf, index));
+        }
+        if (tensor_names != std::set<std::string>{basis_name, offset_name}) {
+            fprintf(stderr, "%s: unexpected affine-subspace tensor inventory in %s\n",
+                    __func__, fname.c_str());
+            break;
+        }
+
+        ggml_tensor * basis_tensor = ggml_get_tensor(context, basis_name.c_str());
+        ggml_tensor * offset_tensor = ggml_get_tensor(context, offset_name.c_str());
+        if (basis_tensor == nullptr || offset_tensor == nullptr
+                || basis_tensor->type != GGML_TYPE_F32
+                || offset_tensor->type != GGML_TYPE_F32
+                || !ggml_is_contiguous(basis_tensor)
+                || !ggml_is_contiguous(offset_tensor)
+                || ggml_n_dims(basis_tensor) != 2
+                || ggml_n_dims(offset_tensor) != 1
+                || basis_tensor->ne[0] <= 0 || basis_tensor->ne[0] > INT32_MAX
+                || basis_tensor->ne[1] != rank
+                || offset_tensor->ne[0] != basis_tensor->ne[0]) {
+            fprintf(stderr, "%s: invalid affine-subspace tensor types or shapes in %s\n",
+                    __func__, fname.c_str());
+            break;
+        }
+
+        const size_t n_embd = (size_t) basis_tensor->ne[0];
+        if (n_embd > std::numeric_limits<size_t>::max() / rank) {
+            fprintf(stderr, "%s: affine-subspace tensor size overflows in %s\n",
+                    __func__, fname.c_str());
+            break;
+        }
+        const size_t basis_count = n_embd * rank;
+        const float * basis_data = static_cast<const float *>(basis_tensor->data);
+        const float * offset_data = static_cast<const float *>(offset_tensor->data);
+        if (!llama_control_vector_is_orthonormal_f32(
+                    basis_data, n_embd, rank)
+                || !llama_control_vector_offset_in_span_f32(
+                    basis_data, offset_data, n_embd, rank)
+                || common_sha256_hex(offset_data, n_embd * sizeof(float))
+                    != offset_hash) {
+            fprintf(stderr, "%s: affine-subspace geometry or payload hash failed in %s\n",
+                    __func__, fname.c_str());
+            break;
+        }
+
+        result.n_embd = (int32_t) n_embd;
+        result.layer = (int32_t) layer;
+        result.rank = (int32_t) rank;
+        result.alpha = alpha;
+        result.basis.assign(basis_data, basis_data + basis_count);
+        result.offset.assign(offset_data, offset_data + n_embd);
+        valid = true;
+    } while (false);
+
+    gguf_free(gguf);
+    ggml_free(context);
+    if (!valid) {
+        result = {};
+    }
     return result;
 }
 

@@ -101,6 +101,39 @@ int main(int argc, char ** argv) {
     const auto baseline_restored = evaluate(ctx, tokens, n_vocab);
     CHECK(maximum_difference(baseline, baseline_restored) <= 1e-6f);
 
+    std::vector<float> basis((size_t) n_embd * 2, 0.0f);
+    std::vector<float> affine_offset(n_embd, 0.0f);
+    basis[0] = 1.0f;
+    basis[n_embd + 1] = 1.0f;
+    affine_offset[0] = 50.0f;
+    CHECK(llama_control_vector_affine_subspace_apply(
+        ctx,
+        basis.data(), basis.size(),
+        affine_offset.data(), affine_offset.size(),
+        n_embd, 2, 1) == 0);
+    const auto subspace = evaluate(ctx, tokens, n_vocab);
+    const auto subspace_reused = evaluate(ctx, tokens, n_vocab);
+    CHECK(maximum_difference(baseline, subspace) > 1e-5f);
+    CHECK(maximum_difference(subspace, subspace_reused) <= 1e-6f);
+
+    // The startup affine state is exclusive even at the low-level API.
+    CHECK(llama_control_vector_apply(
+        ctx, offset.data(), offset.size(), n_embd, 1, n_layer - 1) != 0);
+    CHECK(llama_control_vector_projection_apply(
+        ctx, projection.data(), projection.size(), n_embd, 1, n_layer - 1) != 0);
+
+    CHECK(llama_control_vector_affine_subspace_apply(
+        ctx, nullptr, 0, nullptr, 0, 0, 0, 0) == 0);
+    const auto affine_restored = evaluate(ctx, tokens, n_vocab);
+    CHECK(maximum_difference(baseline, affine_restored) <= 1e-6f);
+
+    // Clearing the new state leaves the established rank-one path byte-stable.
+    CHECK(llama_control_vector_projection_apply(
+        ctx, projection.data(), projection.size(), n_embd, 1, n_layer - 1) == 0);
+    const auto projected_reapplied = evaluate(ctx, tokens, n_vocab);
+    CHECK(maximum_difference(projected, projected_reapplied) <= 1e-6f);
+    CHECK(llama_control_vector_projection_apply(ctx, nullptr, 0, 0, 0, 0) == 0);
+
     llama_free(ctx);
     llama_free_model(model);
     llama_backend_free();
