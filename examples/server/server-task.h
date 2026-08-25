@@ -139,6 +139,8 @@ struct result_timings {
 };
 
 struct server_task_result {
+    virtual ~server_task_result() = default;
+
     int id = -1;
     int id_multi = -1;
 
