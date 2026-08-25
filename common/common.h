@@ -388,6 +388,7 @@ struct gpt_params {
     std::vector<llama_lora_adapter_info> lora_adapters; // lora adapter path with user defined scale
 
     std::vector<llama_control_vector_load_info> control_vectors; // control vector with user defined scale
+    std::string control_vector_projection; // unit control vector projected out before additive vectors
 
     int32_t verbosity                  = 0;
     int32_t control_vector_layer_start = -1; // layer range for control vector
@@ -833,6 +834,7 @@ struct llama_control_vector_data {
 
     // stores data for layers [1, n_layer] where n_layer = data.size() / n_embd
     std::vector<float> data;
+    std::vector<int32_t> layers_present;
 };
 
 struct llama_control_vector_load_info {
@@ -842,8 +844,12 @@ struct llama_control_vector_load_info {
 };
 
 // Load control vectors, scale each by strength, and add them together.
+// If max_layer is non-negative, reject tensor layer indices above it before
+// allocating the dense layer buffer.
 // On error, returns {-1, empty}
-llama_control_vector_data llama_control_vector_load(const std::vector<llama_control_vector_load_info> & load_infos);
+llama_control_vector_data llama_control_vector_load(
+        const std::vector<llama_control_vector_load_info> & load_infos,
+        int32_t max_layer = -1);
 
 //
 // Split utils

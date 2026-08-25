@@ -3213,7 +3213,7 @@ void server_context::process_single_task(server_task&& task) {
 }
 
 bool server_context::apply_control_vectors_internal() {
-    llama_control_vector_data combined_cv = { -1, {} };
+    llama_control_vector_data combined_cv = { -1, {}, {} };
 
     // Check if we have anything to apply
     bool any_active = false;

@@ -9411,10 +9411,10 @@ struct llama_lora_adapter * llama_lora_adapter_init(struct llama_model * model, 
     }
 }
 
-static bool llama_control_vector_init(struct llama_control_vector & cvec, const llama_model & model) {
-    GGML_ASSERT(cvec.tensors.empty());
-    GGML_ASSERT(cvec.ctxs.empty());
-    GGML_ASSERT(cvec.bufs.empty());
+static bool llama_control_vector_init(struct llama_control_vector_bank & bank, const llama_model & model) {
+    GGML_ASSERT(bank.tensors.empty());
+    GGML_ASSERT(bank.ctxs.empty());
+    GGML_ASSERT(bank.bufs.empty());
 
     // count layer buffer types
     std::map<ggml_backend_buffer_type_t, int> buft_layer_count;
@@ -9440,17 +9440,17 @@ static bool llama_control_vector_init(struct llama_control_vector & cvec, const 
     }
 
     // make tensors
-    cvec.tensors.reserve(model.hparams.n_layer);
-    cvec.tensors.push_back(nullptr); // there's never a tensor for layer 0
+    bank.tensors.reserve(model.hparams.n_layer);
+    bank.tensors.push_back(nullptr); // there's never a tensor for layer 0
     for (size_t il = 1; il < model.hparams.n_layer; il++) {
         struct ggml_context * ctx = ctx_map.at(model.buft_layer[il].buft);
         ggml_tensor * tensor = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, model.hparams.n_embd);
-        cvec.tensors.push_back(tensor);
+        bank.tensors.push_back(tensor);
     }
 
     // allocate tensors / buffers and zero
-    cvec.ctxs.reserve(ctx_map.size());
-    cvec.bufs.reserve(ctx_map.size());
+    bank.ctxs.reserve(ctx_map.size());
+    bank.bufs.reserve(ctx_map.size());
     for (auto it : ctx_map) {
         ggml_backend_buffer_type_t buft = it.first;
         ggml_context * ctx = it.second;
@@ -9460,8 +9460,8 @@ static bool llama_control_vector_init(struct llama_control_vector & cvec, const 
             return false;
         }
         ggml_backend_buffer_clear(buf, 0);
-        cvec.ctxs.push_back(ctx);
-        cvec.bufs.push_back(buf);
+        bank.ctxs.push_back(ctx);
+        bank.bufs.push_back(buf);
     }
 
     return true;
@@ -9469,12 +9469,12 @@ static bool llama_control_vector_init(struct llama_control_vector & cvec, const 
 
 int32_t llama_control_vector_apply(struct llama_context * lctx, const float * data, size_t len, int32_t n_embd, int32_t il_start, int32_t il_end) {
     const llama_model & model = lctx->model;
-    llama_control_vector & cvec = lctx->cvec;
+    llama_control_vector_bank & bank = lctx->cvec.additive;
 
     if (data == nullptr) {
         // disable the current control vector (but leave allocated for later)
-        cvec.layer_start = -1;
-        cvec.layer_end   = -1;
+        bank.layer_start = -1;
+        bank.layer_end   = -1;
         return 0;
     }
 
@@ -9482,22 +9482,84 @@ int32_t llama_control_vector_apply(struct llama_context * lctx, const float * da
         LLAMA_LOG_ERROR("%s: control vector n_embd does not match model\n", __func__);
         return 1;
     }
-
-    if (cvec.tensors.empty()) {
-        if (!llama_control_vector_init(cvec, model)) {
+    if (bank.tensors.empty()) {
+        if (!llama_control_vector_init(bank, model)) {
             return 1;
         }
     }
 
-    cvec.layer_start = il_start;
-    cvec.layer_end   = il_end;
+    bank.layer_start = il_start;
+    bank.layer_end   = il_end;
 
     for (size_t il = 1; il < model.hparams.n_layer; il++) {
-        assert(cvec.tensors[il] != nullptr);
+        assert(bank.tensors[il] != nullptr);
 
         const size_t off = n_embd * (il - 1); // buffer doesn't have data for layer 0, since it's never present
         if (off + n_embd <= len) {
-            ggml_backend_tensor_set(cvec.tensors[il], data + off, 0, n_embd * ggml_element_size(cvec.tensors[il]));
+            ggml_backend_tensor_set(bank.tensors[il], data + off, 0, n_embd * ggml_element_size(bank.tensors[il]));
+        }
+    }
+
+    return 0;
+}
+
+int32_t llama_control_vector_projection_apply(struct llama_context * lctx, const float * data, size_t len, int32_t n_embd, int32_t il_start, int32_t il_end) {
+    const llama_model & model = lctx->model;
+    llama_control_vector_bank & bank = lctx->cvec.projection;
+
+    if (data == nullptr) {
+        bank.layer_start = -1;
+        bank.layer_end   = -1;
+        return 0;
+    }
+
+    if (n_embd != (int) model.hparams.n_embd) {
+        LLAMA_LOG_ERROR("%s: control vector n_embd does not match model\n", __func__);
+        return 1;
+    }
+    if (len % (size_t) n_embd != 0) {
+        LLAMA_LOG_ERROR("%s: projection data is not layer-aligned\n", __func__);
+        return 1;
+    }
+    const size_t max_len = model.hparams.n_layer > 0
+        ? (size_t) n_embd * (model.hparams.n_layer - 1)
+        : 0;
+    if (len > max_len) {
+        LLAMA_LOG_ERROR("%s: projection data exceeds model layer count\n", __func__);
+        return 1;
+    }
+    if (il_start < 1 || il_end < il_start || il_end >= (int32_t) model.hparams.n_layer) {
+        LLAMA_LOG_ERROR("%s: invalid projection layer range %d-%d for %u layers\n",
+                __func__, il_start, il_end, model.hparams.n_layer);
+        return 1;
+    }
+    for (int32_t il = il_start; il <= il_end; ++il) {
+        const size_t off = (size_t) n_embd * (il - 1);
+        if (off + n_embd > len) {
+            LLAMA_LOG_ERROR("%s: projection data is missing active layer %d\n", __func__, il);
+            return 1;
+        }
+        if (!llama_control_vector_is_unit_f32(data + off, n_embd)) {
+            LLAMA_LOG_ERROR("%s: projection layer %d is not a finite unit vector\n", __func__, il);
+            return 1;
+        }
+    }
+
+    if (bank.tensors.empty()) {
+        if (!llama_control_vector_init(bank, model)) {
+            return 1;
+        }
+    }
+
+    bank.layer_start = il_start;
+    bank.layer_end   = il_end;
+    for (size_t il = 1; il < model.hparams.n_layer; ++il) {
+        assert(bank.tensors[il] != nullptr);
+        const size_t off = (size_t) n_embd * (il - 1);
+        if (off + n_embd <= len) {
+            ggml_backend_tensor_set(
+                bank.tensors[il], data + off, 0,
+                n_embd * ggml_element_size(bank.tensors[il]));
         }
     }
 

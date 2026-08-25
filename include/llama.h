@@ -797,6 +797,17 @@ extern "C" {
                          int32_t   il_start,
                          int32_t   il_end);
 
+    // Apply a unit control vector as a per-token orthogonal projection, or if
+    // data is NULL, clear only the projection while preserving additive state.
+    // The buffer and layer indexing match llama_control_vector_apply().
+    LLAMA_API int32_t llama_control_vector_projection_apply(
+            struct llama_context * lctx,
+                     const float * data,
+                          size_t   len,
+                         int32_t   n_embd,
+                         int32_t   il_start,
+                         int32_t   il_end);
+
     //
     // KV cache
     //

@@ -223,6 +223,16 @@ target_link_libraries(test-direction-projection PRIVATE ggml)
 add_test(NAME test-direction-projection COMMAND $<TARGET_FILE:test-direction-projection>)
 set_property(TEST test-direction-projection PROPERTY LABELS main)
 
+add_executable(test-control-vector-projection test-control-vector-projection.cpp)
+target_include_directories(test-control-vector-projection PRIVATE ${PROJECT_SOURCE_DIR}/src)
+target_link_libraries(test-control-vector-projection PRIVATE ggml)
+add_test(NAME test-control-vector-projection COMMAND $<TARGET_FILE:test-control-vector-projection>)
+set_property(TEST test-control-vector-projection PROPERTY LABELS main)
+
+# This fixture-backed state test is run explicitly with a tiny model path.
+add_executable(test-control-vector-state test-control-vector-state.cpp)
+target_link_libraries(test-control-vector-state PRIVATE common)
+
 add_executable(test-cvector-layer-capture test-cvector-layer-capture.cpp)
 target_include_directories(test-cvector-layer-capture PRIVATE ${PROJECT_SOURCE_DIR}/examples/cvector-generator)
 add_test(NAME test-cvector-layer-capture COMMAND $<TARGET_FILE:test-cvector-layer-capture>)

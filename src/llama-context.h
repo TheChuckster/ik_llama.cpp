@@ -2,6 +2,7 @@
 
 #include "llama-impl.h"
 #include "llama-cparams.h"
+#include "llama-control-vector.h"
 #include "llama-sampling.h"
 
 #include "llama-spec-features.h"
@@ -286,7 +287,7 @@ struct llama_kv_cache {
     }
 };
 
-struct llama_control_vector {
+struct llama_control_vector_bank {
     std::vector<struct ggml_tensor *> tensors; // per layer
     std::vector<struct ggml_context *> ctxs;
     std::vector<ggml_backend_buffer_t> bufs;
@@ -301,21 +302,28 @@ struct llama_control_vector {
         return tensors[il];
     }
 
-    struct ggml_tensor * apply_to(struct ggml_context * ctx, struct ggml_tensor * cur, int  il) const {
-        ggml_tensor * layer_dir = tensor_for(il);
-        if (layer_dir != nullptr) {
-            cur = ggml_add(ctx, cur, layer_dir);
-        }
-        return cur;
-    }
-
-    ~llama_control_vector() {
+    ~llama_control_vector_bank() {
         for (struct ggml_context * ctx : ctxs) {
             ggml_free(ctx);
         }
         for (ggml_backend_buffer_t buf : bufs) {
             ggml_backend_buffer_free(buf);
         }
+    }
+};
+
+struct llama_control_vector {
+    llama_control_vector_bank additive;
+    llama_control_vector_bank projection;
+
+    struct ggml_tensor * apply_to(struct ggml_context * ctx, struct ggml_tensor * cur, int il) const {
+        if (ggml_tensor * layer_direction = projection.tensor_for(il)) {
+            cur = llama_control_vector_project(ctx, cur, layer_direction);
+        }
+        if (ggml_tensor * layer_offset = additive.tensor_for(il)) {
+            cur = ggml_add(ctx, cur, layer_offset);
+        }
+        return cur;
     }
 };
 

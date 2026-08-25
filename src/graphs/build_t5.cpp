@@ -99,10 +99,7 @@ ggml_cgraph * llm_build_context::build_t5_encoder() {
         cur = ggml_add(ctx0, cur, ffn_inp);
         cb(cur, "ffn_out", il);
 
-        ggml_tensor * layer_dir = lctx.cvec.tensor_for(il);
-        if (layer_dir != nullptr) {
-            cur = ggml_add(ctx0, cur, layer_dir);
-        }
+        cur = lctx.cvec.apply_to(ctx0, cur, il);
         cb(cur, "l_out", il);
 
         // input for next layer
@@ -284,10 +281,7 @@ ggml_cgraph * llm_build_context::build_t5_decoder() {
         cur = ggml_add(ctx0, cur, ffn_inp);
         cb(cur, "ffn_out", il);
 
-        ggml_tensor * layer_dir = lctx.cvec.tensor_for(il);
-        if (layer_dir != nullptr) {
-            cur = ggml_add(ctx0, cur, layer_dir);
-        }
+        cur = lctx.cvec.apply_to(ctx0, cur, il);
         cb(cur, "l_out", il);
 
         // input for next layer

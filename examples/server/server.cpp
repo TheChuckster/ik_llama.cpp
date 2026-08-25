@@ -1692,6 +1692,31 @@ int main(int argc, char ** argv) {
     // Control vector handlers
     const auto handle_control_vectors_list = [&](const httplib::Request & req, httplib::Response & res) {
         json result = json::array();
+        if (!ctx_server.params_base.control_vector_projection.empty()) {
+            result.push_back({
+                {"id", -1},
+                {"path", ctx_server.params_base.control_vector_projection},
+                {"scale", 1.0},
+                {"layer_start", ctx_server.params_base.control_vector_layer_start},
+                {"layer_end", ctx_server.params_base.control_vector_layer_end},
+                {"applied", true},
+                {"type", "projection"},
+                {"read_only", true},
+            });
+            for (size_t i = 0; i < ctx_server.params_base.control_vectors.size(); ++i) {
+                const auto & cv = ctx_server.params_base.control_vectors[i];
+                result.push_back({
+                    {"id", -(int) i - 2},
+                    {"path", cv.fname},
+                    {"scale", cv.strength},
+                    {"layer_start", ctx_server.params_base.control_vector_layer_start},
+                    {"layer_end", ctx_server.params_base.control_vector_layer_end},
+                    {"applied", true},
+                    {"type", "affine_offset"},
+                    {"read_only", true},
+                });
+            }
+        }
         for (size_t i = 0; i < ctx_server.control_vectors.size(); ++i) {
             auto & cv = ctx_server.control_vectors[i];
             result.push_back({
@@ -1708,6 +1733,11 @@ int main(int argc, char ** argv) {
     };
 
     const auto handle_control_vectors_load = [&](const httplib::Request & req, httplib::Response & res) {
+        if (!ctx_server.params_base.control_vector_projection.empty()) {
+            res.set_content(json{{ "success", false }, { "error", "Hot control-vector mutation is disabled while a startup projection is active" }}.dump(), "application/json");
+            res.status = 409;
+            return;
+        }
         const json body = json::parse(req.body);
 
         server_task task;
@@ -1725,6 +1755,11 @@ int main(int argc, char ** argv) {
     };
 
     const auto handle_control_vectors_unload = [&](const httplib::Request & req, httplib::Response & res) {
+        if (!ctx_server.params_base.control_vector_projection.empty()) {
+            res.set_content(json{{ "success", false }, { "error", "Hot control-vector mutation is disabled while a startup projection is active" }}.dump(), "application/json");
+            res.status = 409;
+            return;
+        }
         const json body = json::parse(req.body);
 
         server_task task;
@@ -1742,6 +1777,11 @@ int main(int argc, char ** argv) {
     };
 
     const auto handle_control_vectors_apply = [&](const httplib::Request & req, httplib::Response & res) {
+        if (!ctx_server.params_base.control_vector_projection.empty()) {
+            res.set_content(json{{ "success", false }, { "error", "Hot control-vector mutation is disabled while a startup projection is active" }}.dump(), "application/json");
+            res.status = 409;
+            return;
+        }
         const std::vector<json> body = json::parse(req.body);
         int max_idx = ctx_server.control_vectors.size();
 

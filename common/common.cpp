@@ -1730,6 +1730,14 @@ bool gpt_params_find_arg(int argc, char ** argv, const std::string & arg, gpt_pa
         params.control_vectors.push_back({ std::stof(argv[i]), fname, });
         return true;
     }
+    if (arg == "--control-vector-projection") {
+        CHECK_ARG
+        if (!params.control_vector_projection.empty()) {
+            throw std::invalid_argument("--control-vector-projection may only be specified once");
+        }
+        params.control_vector_projection = argv[i];
+        return true;
+    }
     if (arg == "--control-vector-layer-range") {
         CHECK_ARG
         params.control_vector_layer_start = std::stoi(argv[i]);
@@ -3374,8 +3382,11 @@ void gpt_params_print_usage(int /*argc*/, char ** argv, const gpt_params & param
     options.push_back({ "*",           "       --control-vector-scaled FNAME SCALE",
                                                                         "add a control vector with user defined scaling SCALE\n"
                                                                         "note: this argument can be repeated to add multiple scaled control vectors" });
+    options.push_back({ "*",           "       --control-vector-projection FNAME",
+                                                                        "project out one unit control vector before additive control vectors\n"
+                                                                        "(for affine concept editing; may be specified once)" });
     options.push_back({ "*",           "       --control-vector-layer-range START END",
-                                                                        "layer range to apply the control vector(s) to, start and end inclusive" });
+                                                                        "layer range to apply additive and projection control vectors to, start and end inclusive" });
     options.push_back({ "*",           "-m,    --model FNAME",          "model path (default: models/$filename with filename from --hf-file\n"
                                                                         "or --model-url if set, otherwise %s)", DEFAULT_MODEL_PATH });
     options.push_back({ "*",           "-md,   --model-draft FNAME",    "draft model for speculative decoding (default: unused)" });
@@ -4101,15 +4112,71 @@ struct llama_init_result llama_init_from_gpt_params(gpt_params & params) {
         llama_set_offload_policy(lctx, op, on_off);
     }
 
-    if (!params.control_vectors.empty()) {
+    if (!params.control_vector_projection.empty()) {
+        if (params.control_vector_layer_start == -1) params.control_vector_layer_start = 1;
+        if (params.control_vector_layer_end   == -1) params.control_vector_layer_end   = llama_n_layer(model) - 1;
+    } else if (!params.control_vectors.empty()) {
         if (params.control_vector_layer_start <= 0) params.control_vector_layer_start = 1;
         if (params.control_vector_layer_end   <= 0) params.control_vector_layer_end   = llama_n_layer(model);
+    }
 
-        const auto cvec = llama_control_vector_load(params.control_vectors);
+    if (!params.control_vector_projection.empty()) {
+        const auto projection = llama_control_vector_load({{
+            1.0f, params.control_vector_projection,
+        }}, llama_n_layer(model) - 1);
+        if (projection.n_embd == -1) {
+            llama_free(lctx);
+            llama_free_model(model);
+            return iparams;
+        }
+
+        int err = llama_control_vector_projection_apply(lctx,
+                                                        projection.data.data(),
+                                                        projection.data.size(),
+                                                        projection.n_embd,
+                                                        params.control_vector_layer_start,
+                                                        params.control_vector_layer_end);
+        if (err) {
+            llama_free(lctx);
+            llama_free_model(model);
+            return iparams;
+        }
+    }
+
+    if (!params.control_vectors.empty()) {
+        const auto cvec = llama_control_vector_load(
+            params.control_vectors,
+            !params.control_vector_projection.empty() ? llama_n_layer(model) - 1 : -1);
         if (cvec.n_embd == -1) {
             llama_free(lctx);
             llama_free_model(model);
             return iparams;
+        }
+
+        if (!params.control_vector_projection.empty()) {
+            for (int32_t il = params.control_vector_layer_start;
+                    il <= params.control_vector_layer_end; ++il) {
+                if (!std::binary_search(
+                        cvec.layers_present.begin(), cvec.layers_present.end(), il)) {
+                    fprintf(stderr, "%s: affine offset data is missing active layer %d\n",
+                            __func__, il);
+                    llama_free(lctx);
+                    llama_free_model(model);
+                    return iparams;
+                }
+                const size_t off = (size_t) cvec.n_embd * (il - 1);
+                if (off + cvec.n_embd > cvec.data.size()
+                        || !std::all_of(
+                            cvec.data.begin() + off,
+                            cvec.data.begin() + off + cvec.n_embd,
+                            [](float value) { return std::isfinite(value); })) {
+                    fprintf(stderr, "%s: affine offset data is invalid at active layer %d\n",
+                            __func__, il);
+                    llama_free(lctx);
+                    llama_free_model(model);
+                    return iparams;
+                }
+            }
         }
 
         int err = llama_control_vector_apply(lctx,
@@ -5083,8 +5150,9 @@ float common_embd_similarity_cos(const float * embd1, const float * embd2, int n
 // Control vector utils
 //
 
-static llama_control_vector_data llama_control_vector_load_one(const llama_control_vector_load_info & load_info) {
-    llama_control_vector_data result = { -1, {} };
+static llama_control_vector_data llama_control_vector_load_one(
+        const llama_control_vector_load_info & load_info, int32_t max_layer) {
+    llama_control_vector_data result = { -1, {}, {} };
 
     ggml_context * ctx = nullptr;
     struct gguf_init_params meta_gguf_params = {
@@ -5124,6 +5192,11 @@ static llama_control_vector_data llama_control_vector_load_one(const llama_contr
             fprintf(stderr, "%s: invalid (zero) direction tensor layer index in %s\n", __func__, load_info.fname.c_str());
             result.n_embd = -1;
             break;
+        } else if (max_layer >= 0 && layer_idx > max_layer) {
+            fprintf(stderr, "%s: direction tensor layer %d exceeds maximum layer %d in %s\n",
+                    __func__, layer_idx, max_layer, load_info.fname.c_str());
+            result.n_embd = -1;
+            break;
         }
 
         struct ggml_tensor * tensor = ggml_get_tensor(ctx, name.c_str());
@@ -5148,6 +5221,10 @@ static llama_control_vector_data llama_control_vector_load_one(const llama_contr
 
         // extend if necessary - do not store data for layer 0 (it's not used)
         result.data.resize(std::max(result.data.size(), static_cast<size_t>(result.n_embd * layer_idx)), 0.0f);
+        if (std::find(result.layers_present.begin(), result.layers_present.end(), layer_idx)
+                == result.layers_present.end()) {
+            result.layers_present.push_back(layer_idx);
+        }
 
         const float * src = (const float *) tensor->data;
         float * dst = result.data.data() + result.n_embd * (layer_idx - 1);  // layer 1 at [0]
@@ -5160,7 +5237,10 @@ static llama_control_vector_data llama_control_vector_load_one(const llama_contr
     if (result.n_embd == -1) {
         fprintf(stderr, "%s: skipping %s due to invalid direction tensors\n", __func__, load_info.fname.c_str());
         result.data.clear();
+        result.layers_present.clear();
     }
+
+    std::sort(result.layers_present.begin(), result.layers_present.end());
 
     gguf_free(ctx_gguf);
     ggml_free(ctx);
@@ -5168,11 +5248,13 @@ static llama_control_vector_data llama_control_vector_load_one(const llama_contr
     return result;
 }
 
-llama_control_vector_data llama_control_vector_load(const std::vector<llama_control_vector_load_info> & load_infos) {
-    llama_control_vector_data result = { -1, {} };
+llama_control_vector_data llama_control_vector_load(
+        const std::vector<llama_control_vector_load_info> & load_infos,
+        int32_t max_layer) {
+    llama_control_vector_data result = { -1, {}, {} };
 
     for (const auto & info : load_infos) {
-        auto cur = llama_control_vector_load_one(info);
+        auto cur = llama_control_vector_load_one(info, max_layer);
 
         if (cur.n_embd == -1) {
             result.n_embd = -1;
@@ -5191,12 +5273,20 @@ llama_control_vector_data llama_control_vector_load(const std::vector<llama_cont
             for (size_t i = 0; i < cur.data.size(); i++) {
                 result.data[i] += cur.data[i];
             }
+            result.layers_present.insert(
+                result.layers_present.end(),
+                cur.layers_present.begin(), cur.layers_present.end());
+            std::sort(result.layers_present.begin(), result.layers_present.end());
+            result.layers_present.erase(
+                std::unique(result.layers_present.begin(), result.layers_present.end()),
+                result.layers_present.end());
         }
     }
 
     if (result.n_embd == -1) {
         fprintf(stderr, "%s: no valid control vector files passed\n", __func__);
         result.data.clear();
+        result.layers_present.clear();
     }
 
     return result;
