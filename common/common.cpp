@@ -2926,6 +2926,16 @@ bool gpt_params_find_arg(int argc, char ** argv, const std::string & arg, gpt_pa
         params.cvector_negative_file = argv[i];
         return true;
     }
+    if (arg == "--activations-output") {
+        CHECK_ARG
+        params.cvector_activations_outfile = argv[i];
+        return true;
+    }
+    if (arg == "--activations-layers") {
+        CHECK_ARG
+        params.cvector_activation_layers = argv[i];
+        return true;
+    }
     if (arg == "--pca-batch") {
         CHECK_ARG
         params.n_pca_batch = std::stoi(argv[i]);
@@ -3478,6 +3488,10 @@ void gpt_params_print_usage(int /*argc*/, char ** argv, const gpt_params & param
     options.push_back({ "cvector",     "-o,    --output FNAME",         "output file (default: '%s')", params.cvector_outfile.c_str() });
     options.push_back({ "cvector",     "       --positive-file FNAME",  "positive prompts file, one prompt per line (default: '%s')", params.cvector_positive_file.c_str() });
     options.push_back({ "cvector",     "       --negative-file FNAME",  "negative prompts file, one prompt per line (default: '%s')", params.cvector_negative_file.c_str() });
+    options.push_back({ "cvector",     "       --activations-output FNAME",
+                                                                        "also write raw final-token positive/negative activations to GGUF" });
+    options.push_back({ "cvector",     "       --activations-layers SPEC",
+                                                                        "1-based activation layers to write, for example 56-73 or 56,64,73" });
     options.push_back({ "cvector",     "       --pca-batch N",          "batch size used for PCA. Larger batch runs faster, but uses more memory (default: %d)", params.n_pca_batch });
     options.push_back({ "cvector",     "       --pca-iter N",           "number of iterations used for PCA (default: %d)", params.n_pca_iterations });
     options.push_back({ "cvector",     "       --method {pca,mean,mean-last}",

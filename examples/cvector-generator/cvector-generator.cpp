@@ -186,6 +186,7 @@ struct train_context {
     ggml_context * ctx_ggml;
     int n_embd;
     int n_layers;
+    int n_activation_samples = 0;
 
     /* pair of prompts to be used for generating final vector */
     std::vector<std::string> positive_entries;
@@ -196,16 +197,21 @@ struct train_context {
     // NOTE (2): v_diff is transposed from v_diff_tmp
     std::vector<struct ggml_tensor *> v_diff;  // vector of matrices of size [m, n_embd] where m ~ n_tokens * n_completions (v_diff contains no zero-rows)
     std::vector<struct ggml_tensor *> v_final; // vector of vectors of size [n_embd] to be written to file
+    std::vector<struct ggml_tensor *> v_activations; // selected [n_embd, n_samples] positive/negative matrices
 
     // to easily re-alloc when concat v_diff, we temporary store v_diff in a vector instead of a tensor
     // v_diff_tmp will get converted unto v_diff later on
     std::vector<std::vector<uint8_t>> v_diff_tmp;
+    std::vector<std::vector<uint8_t>> v_pos_activation_tmp;
+    std::vector<std::vector<uint8_t>> v_neg_activation_tmp;
+    std::vector<int> activation_layers;
 
-    train_context(int n_embd_, int n_layers_) {
+    train_context(int n_embd_, int n_layers_, const std::vector<int> & activation_layers_) {
         n_embd = n_embd_;
         n_layers = n_layers_;
+        activation_layers = activation_layers_;
         struct ggml_init_params params_ggml = {
-            /*.mem_size   =*/ ggml_tensor_overhead() * (n_layers - 1) * 2u,
+            /*.mem_size   =*/ ggml_tensor_overhead() * ((n_layers - 1) * 2u + activation_layers.size() * 2u),
             /*.mem_buffer =*/ NULL,
             /*.no_alloc   =*/ true,
         };
@@ -216,6 +222,56 @@ struct train_context {
             auto t = ggml_new_tensor_1d(ctx_ggml, GGML_TYPE_F32, n_embd);
             t->data = malloc(ggml_nbytes(t)); // TODO: get rid of malloc if possible
             v_final.push_back(t);
+        }
+        v_pos_activation_tmp.resize(n_layers - 1);
+        v_neg_activation_tmp.resize(n_layers - 1);
+    }
+
+    void concat_activations(
+            const std::vector<struct ggml_tensor *> & positive,
+            const std::vector<struct ggml_tensor *> & negative) {
+        if (activation_layers.empty()) {
+            return;
+        }
+        GGML_ASSERT((int) positive.size() == n_layers - 1);
+        GGML_ASSERT((int) negative.size() == n_layers - 1);
+        for (const int layer : activation_layers) {
+            const int index = layer - 1;
+            GGML_ASSERT(positive[index]->ne[0] == n_embd && positive[index]->ne[1] == 1);
+            GGML_ASSERT(negative[index]->ne[0] == n_embd && negative[index]->ne[1] == 1);
+            const size_t n_bytes = n_embd * sizeof(float);
+            auto & pos = v_pos_activation_tmp[index];
+            auto & neg = v_neg_activation_tmp[index];
+            const size_t pos_offset = pos.size();
+            const size_t neg_offset = neg.size();
+            pos.resize(pos_offset + n_bytes);
+            neg.resize(neg_offset + n_bytes);
+            memcpy(pos.data() + pos_offset, positive[index]->data, n_bytes);
+            memcpy(neg.data() + neg_offset, negative[index]->data, n_bytes);
+        }
+        ++n_activation_samples;
+    }
+
+    void build_activation_tensors() {
+        if (activation_layers.empty()) {
+            return;
+        }
+        GGML_ASSERT(n_activation_samples > 0);
+        const size_t expected_bytes = (size_t) n_embd * n_activation_samples * sizeof(float);
+        for (const int layer : activation_layers) {
+            const int index = layer - 1;
+            GGML_ASSERT(v_pos_activation_tmp[index].size() == expected_bytes);
+            GGML_ASSERT(v_neg_activation_tmp[index].size() == expected_bytes);
+            auto * positive = ggml_new_tensor_2d(
+                    ctx_ggml, GGML_TYPE_F32, n_embd, n_activation_samples);
+            auto * negative = ggml_new_tensor_2d(
+                    ctx_ggml, GGML_TYPE_F32, n_embd, n_activation_samples);
+            ggml_format_name(positive, "positive.%d", layer);
+            ggml_format_name(negative, "negative.%d", layer);
+            positive->data = v_pos_activation_tmp[index].data();
+            negative->data = v_neg_activation_tmp[index].data();
+            v_activations.push_back(positive);
+            v_activations.push_back(negative);
         }
     }
 
@@ -381,6 +437,30 @@ static void export_gguf(const std::vector<struct ggml_tensor *> & v_ctrl, const 
     gguf_free(ctx);
 }
 
+static void export_activations_gguf(
+        const std::vector<struct ggml_tensor *> & activations,
+        const std::string & fname,
+        const std::string & model_hint,
+        int n_samples,
+        const std::string & layer_spec) {
+    struct gguf_context * ctx = gguf_init_empty();
+    const std::string arch = "activationcapture";
+    gguf_set_val_str(ctx, "general.architecture", arch.c_str());
+    gguf_set_val_str(ctx, (arch + ".model_hint").c_str(), model_hint.c_str());
+    gguf_set_val_str(ctx, (arch + ".method").c_str(), "final-templated-prompt-position");
+    gguf_set_val_str(ctx, (arch + ".layer_spec").c_str(), layer_spec.c_str());
+    gguf_set_val_i32(ctx, (arch + ".sample_count").c_str(), n_samples);
+    gguf_set_val_i32(ctx, (arch + ".tensor_count").c_str(), activations.size());
+    for (auto * tensor : activations) {
+        gguf_add_tensor(ctx, tensor);
+        printf("Added activation tensor: %s\n", tensor->name);
+    }
+    printf("%s: writing file...\n", __func__);
+    gguf_write_to_file(ctx, fname.c_str(), false);
+    printf("%s: wrote file '%s'\n", __func__, fname.c_str());
+    gguf_free(ctx);
+}
+
 /**
  * Load prompt files and completion file.
  * Then format each pair of prompt + completion to make an entry.
@@ -418,6 +498,20 @@ int main(int argc, char ** argv) {
         fprintf(stderr, "--apply-chat-template requires --jinja so the embedded model template is used exactly\n");
         return 1;
     }
+    if (!params.cvector_activations_outfile.empty() &&
+            params.cvector_dimre_method != DIMRE_METHOD_MEAN_LAST) {
+        fprintf(stderr, "--activations-output requires --method mean-last\n");
+        return 1;
+    }
+    if (params.cvector_activations_outfile.empty() != params.cvector_activation_layers.empty()) {
+        fprintf(stderr, "--activations-output and --activations-layers must be provided together\n");
+        return 1;
+    }
+    if (!params.cvector_activations_outfile.empty() &&
+            params.cvector_activations_outfile == params.cvector_outfile) {
+        fprintf(stderr, "control-vector and activation outputs must be different files\n");
+        return 1;
+    }
 
 
     callback_data cb_data;
@@ -445,8 +539,22 @@ int main(int argc, char ** argv) {
     char model_hint[128];
     llama_model_meta_val_str(model, "general.architecture", model_hint, 128);
 
+    std::vector<int> activation_layers;
+    try {
+        if (!params.cvector_activation_layers.empty()) {
+            activation_layers = cvector_parse_layer_spec(
+                    params.cvector_activation_layers, n_layers - 1);
+        }
+    } catch (const std::invalid_argument & exc) {
+        fprintf(stderr, "invalid --activations-layers: %s\n", exc.what());
+        llama_free(ctx);
+        llama_free_model(model);
+        llama_backend_free();
+        return 1;
+    }
+
     // init train_context
-    train_context ctx_train(n_embd, n_layers);
+    train_context ctx_train(n_embd, n_layers, activation_layers);
 
     // load and prepare entries for training
     if (prepare_entries(params, ctx_train) != 0) {
@@ -530,6 +638,11 @@ int main(int argc, char ** argv) {
             break;
         }
 
+        // Preserve the unpaired final-token activations before calc_diff()
+        // mutates the positive rows in place. These raw matrices permit
+        // manifold methods such as SOM without loading the model again.
+        ctx_train.concat_activations(cb_data.v_pos, cb_data.v_neg);
+
         // calculate diff and remove all zero rows
         auto v_diff_filtered = cb_data.calc_diff();
 
@@ -569,6 +682,15 @@ int main(int argc, char ** argv) {
 
     // write output vectors to gguf
     export_gguf(ctx_train.v_final, params.cvector_outfile, model_hint);
+    if (!params.cvector_activations_outfile.empty()) {
+        ctx_train.build_activation_tensors();
+        export_activations_gguf(
+                ctx_train.v_activations,
+                params.cvector_activations_outfile,
+                model_hint,
+                ctx_train.n_activation_samples,
+                params.cvector_activation_layers);
+    }
 
     llama_backend_free();
 

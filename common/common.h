@@ -599,6 +599,8 @@ struct gpt_params {
     std::string cvector_outfile       = "control_vector.gguf";
     std::string cvector_positive_file = "examples/cvector-generator/positive.txt";
     std::string cvector_negative_file = "examples/cvector-generator/negative.txt";
+    std::string cvector_activations_outfile = "";
+    std::string cvector_activation_layers   = "";
 
     bool spm_infill = false; // suffix/prefix/middle pattern for infill
 

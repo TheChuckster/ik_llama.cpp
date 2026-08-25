@@ -27,6 +27,13 @@ Related PRs:
     --positive-file harmful.txt --negative-file harmless.txt \
     --method mean-last --apply-chat-template --jinja
 
+# Also retain per-prompt activations for a multi-direction manifold method.
+# Layers are 1-based and use the same numbering as direction.N tensors.
+./cvector-generator -m ./model.gguf \
+    --positive-file harmful.txt --negative-file harmless.txt \
+    --method mean-last --apply-chat-template --jinja \
+    --activations-output activations.gguf --activations-layers 56-73
+
 # To see help message
 ./cvector-generator -h
 # Then, have a look at "cvector" section
@@ -41,6 +48,11 @@ different built-in template. As in the original control-vector generator, the
 final transformer layer is omitted. Capture uses exact `l_out-N` node names so
 architectures that delay output-row narrowing, including Kimi K3, cannot add an
 extra final-layer vector or accidentally match similarly prefixed graph nodes.
+`--activations-output` preserves the positive and negative activation matrices
+as F32 tensors named `positive.N` and `negative.N`. It is available only with
+`mean-last` and requires an explicit layer set, preventing an accidental dump
+of every layer for a very large dataset. The main difference-in-means control
+vector is still produced normally.
 
 ## Tips and tricks
 
