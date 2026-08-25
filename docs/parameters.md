@@ -185,6 +185,7 @@ Incorrect prompt template or it's format may break the model output.
 | `-rea, --reasoning` | Use reasoning/thinking in the chat | 'auto' (detect from template) | on / off / auto [PR 1376](https://github.com/ikawrakow/ik_llama.cpp/pull/1376) |
 | `--reasoning-budget N` | Token budget for thinking | -1 | -1 for unrestricted, 0 for immediate end, N>0 for token budget [PR 1376](https://github.com/ikawrakow/ik_llama.cpp/pull/1376) |
 | `--reasoning-budget-message` | Message injected before the end-of-thinking tag when reasoning budget is exhausted  | none | [PR 1376](https://github.com/ikawrakow/ik_llama.cpp/pull/1376) |
+| `--reasoning-prefill TEXT` | Append fixed text inside the native reasoning block for every new assistant turn | none | Server-only. Requires enabled thinking, a supported reasoning parser, and a template positioned exactly after its reasoning-start tag. Incompatible requests fail instead of silently omitting or relocating the prefill. |
 | `-ptcall, --parallel-tool-calls` | Enable parallel tool calls | - | [PR 1376](https://github.com/ikawrakow/ik_llama.cpp/pull/1376) |
 | `--skip-chat-parsing` | force a pure content parser, even if a Jinja template is specified; model will output everything | - | [PR 1376](https://github.com/ikawrakow/ik_llama.cpp/pull/1376) |
 | `--peg` | Use peg parser for qwen3.5 models. | - | Force Qwen3.5 model to use peg parser to process tool calls, which fixes the crash when the model calls the non existing function. [PR 1490](https://github.com/ikawrakow/ik_llama.cpp/pull/1490) |

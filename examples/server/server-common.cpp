@@ -650,6 +650,10 @@ json oaicompat_chat_params_parse(
     auto stream = json_value(body, "stream", false);
     auto tool_choice = json_value(body, "tool_choice", std::string("auto"));
 
+    if (body.contains("reasoning_prefill")) {
+        throw std::runtime_error("reasoning_prefill is a server-only option; use --reasoning-prefill at startup");
+    }
+
     if (!opt.use_jinja) {
         if (has_tools) {
             throw std::runtime_error("tools param requires --jinja flag");
@@ -841,6 +845,14 @@ json oaicompat_chat_params_parse(
         "when this flag is set, if the last message is an assistant message then it will be treated as a full message and not prefilled\n"*/
     bool prefill_assistant_message = !inputs.messages.empty() && inputs.messages.back().role == "assistant" && opt.prefill_assistant;
     common_chat_msg last_message;
+    if (!opt.reasoning_prefill.empty()) {
+        if (prefill_assistant_message) {
+            throw std::runtime_error("Reasoning prefill is incompatible with assistant response prefill.");
+        }
+        if (!inputs.add_generation_prompt) {
+            throw std::runtime_error("Reasoning prefill requires add_generation_prompt=true.");
+        }
+    }
     if (prefill_assistant_message) {
         last_message = inputs.messages.back();
         inputs.messages.pop_back();
@@ -861,6 +873,8 @@ json oaicompat_chat_params_parse(
 
     // Apply chat template to the list of messages
     auto chat_params = common_chat_templates_apply(opt.tmpls.get(), inputs);
+
+    common_chat_apply_reasoning_prefill(chat_params, opt.reasoning_prefill, inputs.enable_thinking);
 
     /* Append assistant prefilled message */
     if (prefill_assistant_message) {

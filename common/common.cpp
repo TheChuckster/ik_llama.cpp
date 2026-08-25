@@ -2778,6 +2778,18 @@ bool gpt_params_find_arg(int argc, char ** argv, const std::string & arg, gpt_pa
         params.reasoning_budget_message = value;
         return true;
     }
+    if (arg == "--reasoning-prefill") {
+        CHECK_ARG
+        std::string value = argv[i];
+        if (value.empty()) {
+            throw std::invalid_argument("error: --reasoning-prefill cannot be empty");
+        }
+        if (value.size() > 16 * 1024) {
+            throw std::invalid_argument("error: --reasoning-prefill cannot exceed 16 KiB");
+        }
+        params.reasoning_prefill = std::move(value);
+        return true;
+    }
     if (arg == "--skip-chat-parsing") {
         params.force_pure_content_parser = true;
         return true;
@@ -3257,6 +3269,8 @@ void gpt_params_print_usage(int /*argc*/, char ** argv, const gpt_params & param
                         "Or comma separated start and end tokens such as [THINK],[/THINK]\n"
                         "(default: auto)" });
     options.push_back({ "main",        "       --reasoning-budget-message",  "message injected before the end-of-thinking tag when reasoning budget is exhausted (default: none)" });
+    options.push_back({ "server",      "       --reasoning-prefill TEXT", "fixed text appended after the native reasoning-start tag for each new assistant turn; "
+                        "requires enabled thinking and a supported reasoning template (default: none)" });
     options.push_back({ "main",        "       --skip-chat-parsing",  "force a pure content parser, even if a Jinja template is specified; model will output everything "
             "in the content section, including any reasoning and/or tool calls (default: disabled)" });
     options.push_back({ "main",        "       --no-prefill-assistant",  "whether to prefill the assistant's response if the last message is an assistant message (default: prefill enabled)\n"

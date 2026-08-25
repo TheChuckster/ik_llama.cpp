@@ -291,6 +291,7 @@ struct server_chat_params {
     bool parallel_tool_calls = false;
     int  reasoning_budget = -1;
     std::string reasoning_budget_message;
+    std::string reasoning_prefill;
     bool force_pure_content = false;
 };
 

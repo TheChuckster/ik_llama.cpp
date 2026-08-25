@@ -278,6 +278,42 @@ bool common_chat_templates_support_enable_thinking(const common_chat_templates *
     return params.supports_thinking;
 }
 
+void common_chat_apply_reasoning_prefill(common_chat_params & params,
+                                         const std::string &   reasoning_prefill,
+                                         bool                  enable_thinking) {
+    if (reasoning_prefill.empty()) {
+        return;
+    }
+    if (reasoning_prefill.size() > 16 * 1024) {
+        throw std::invalid_argument("Reasoning prefill cannot exceed 16 KiB.");
+    }
+    if (!enable_thinking) {
+        throw std::invalid_argument("Reasoning prefill requires enable_thinking.");
+    }
+    if (!params.supports_thinking) {
+        throw std::invalid_argument("Reasoning prefill requires a supported reasoning template and parser.");
+    }
+    if (params.thinking_start_tag.empty() || params.thinking_end_tag.empty()) {
+        throw std::invalid_argument("Reasoning prefill requires non-empty reasoning start and end tags.");
+    }
+    if (params.thinking_start_tag == params.thinking_end_tag) {
+        throw std::invalid_argument("Reasoning prefill requires distinct reasoning start and end tags.");
+    }
+    if (reasoning_prefill.find(params.thinking_start_tag) != std::string::npos ||
+        reasoning_prefill.find(params.thinking_end_tag) != std::string::npos) {
+        throw std::invalid_argument("Reasoning prefill cannot contain a reasoning delimiter.");
+    }
+    if (!string_ends_with(params.prompt, params.thinking_start_tag)) {
+        throw std::invalid_argument("Rendered prompt is not positioned immediately after the reasoning-start tag.");
+    }
+    if (!string_ends_with(params.generation_prompt, params.thinking_start_tag)) {
+        throw std::invalid_argument("Generation prompt is not positioned immediately after the reasoning-start tag.");
+    }
+
+    params.prompt += reasoning_prefill;
+    params.generation_prompt += reasoning_prefill;
+}
+
 std::vector<common_chat_msg> common_chat_msgs_parse_oaicompat(const json & messages) {
     std::vector<common_chat_msg> msgs;
 

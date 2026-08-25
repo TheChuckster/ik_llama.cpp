@@ -256,6 +256,13 @@ std::string common_chat_templates_source(const struct common_chat_templates * tm
 struct common_chat_params common_chat_templates_apply(const struct common_chat_templates *        tmpls,
                                                       const struct common_chat_templates_inputs & inputs);
 
+// Append a fixed reasoning seed to both the model prompt and the parser/sampler
+// generation prompt. Throws unless both are positioned immediately after the
+// native reasoning-start tag.
+void common_chat_apply_reasoning_prefill(struct common_chat_params & params,
+                                         const std::string &         reasoning_prefill,
+                                         bool                        enable_thinking);
+
 // Format single message, while taking into account the position of that message in chat history
 std::string common_chat_format_single(const struct common_chat_templates * tmpls,
                                       const std::vector<common_chat_msg> & past_msg,

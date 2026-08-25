@@ -529,6 +529,7 @@ struct gpt_params {
     int enable_reasoning = -1; // -1 = auto, 0 = disable, 1 = enable
     int reasoning_budget = -1;
     std::string reasoning_budget_message; // message injected before end tag when budget exhausted
+    std::string reasoning_prefill; // fixed text appended inside the native reasoning block
     std::map<std::string, std::string> default_template_kwargs;
 
     thinking_tokens think_tokens;

@@ -451,6 +451,7 @@ void server_context::init() {
             /* parallel_tool_calls  */ params_base.parallel_tool_calls,
             /* reasoning_budget      */ params_base.reasoning_budget,
             /* reasoning_budget_msg  */ params_base.reasoning_budget_message,
+            /* reasoning_prefill     */ params_base.reasoning_prefill,
             /* force_pure_content    */ params_base.force_pure_content_parser
            // /* media_path            */ params_base.media_path,
         };
