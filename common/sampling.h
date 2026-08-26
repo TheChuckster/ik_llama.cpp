@@ -308,6 +308,13 @@ std::string llama_sampling_type_to_str(llama_sampler_type sampler_type);
 std::vector<llama_sampler_type> llama_sampling_types_from_names(const std::vector<std::string> & names, bool allow_alt_names);
 std::vector<llama_sampler_type> llama_sampling_types_from_chars(const std::string & names_string);
 
+// Apply deterministic, stateful greedy transforms and select the highest-logit token.
+// The sampling temperature must be <= 0. A negative temperature also computes probabilities.
+llama_token common_sampler_sample_greedy(
+        struct common_sampler * ctx_sampling,
+        struct llama_context * ctx_main,
+        llama_token_data_array & cur_p);
+
 // this is a common sampling function used across the examples for convenience
 // it can serve as a starting point for implementing your own sampling function
 // Note: When using multiple sequences, it is the caller's responsibility to call

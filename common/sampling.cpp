@@ -491,6 +491,40 @@ static void sampler_queue(
     }
 }
 
+static void sampler_queue_greedy(
+        struct llama_context * ctx_main,
+        struct common_sampler * ctx_sampling,
+        llama_token_data_array & cur_p) {
+    // Greedy mode intentionally skips filters which cannot change the argmax and
+    // stochastic samplers which would violate deterministic sampling. DRY is a
+    // deterministic, history-dependent logit transform and must still run.
+    for (const auto sampler_type : ctx_sampling->params.samplers_sequence) {
+        if (sampler_type == llama_sampler_type::DRY) {
+            GGML_ASSERT(ctx_sampling->smpl != nullptr);
+            llama_sample_dry(ctx_main, ctx_sampling->smpl, &cur_p);
+        }
+    }
+}
+
+llama_token common_sampler_sample_greedy(
+        struct common_sampler * ctx_sampling,
+        struct llama_context * ctx_main,
+        llama_token_data_array & cur_p) {
+    GGML_ASSERT(ctx_sampling != nullptr);
+    GGML_ASSERT(ctx_sampling->params.temp <= 0.0f);
+
+    sampler_queue_greedy(ctx_main, ctx_sampling, cur_p);
+
+    if (ctx_sampling->params.temp < 0.0f) {
+        // Greedy sampling, with probabilities.
+        llama_sample_softmax(ctx_main, &cur_p);
+        return cur_p.data[0].id;
+    }
+
+    // Greedy sampling, without probabilities.
+    return llama_sample_token_greedy(ctx_main, &cur_p);
+}
+
 static bool grammar_should_apply(struct common_sampler * gsmpl) {
     if (!gsmpl->grammar) {
         return false;
@@ -539,13 +573,8 @@ static llama_token llama_sampling_sample_impl(
     }
 
     // llama_sampler_apply
-    if (temp < 0.0) {
-        // greedy sampling, with probs
-        llama_sample_softmax(ctx_main, &cur_p);
-        id = cur_p.data[0].id;
-    } else if (temp == 0.0) {
-        // greedy sampling, no probs
-        id = llama_sample_token_greedy(ctx_main, &cur_p);
+    if (temp <= 0.0f) {
+        id = common_sampler_sample_greedy(ctx_sampling, ctx_main, cur_p);
     } else {
         if (mirostat == 1) {
             const int mirostat_m = 100;
