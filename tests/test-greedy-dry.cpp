@@ -214,6 +214,38 @@ void test_newline_breaker_exempts_repeated_newline_at_zero_temperature(
     common_sampler_free(with_breaker);
 }
 
+void test_quote_star_breakers_penalize_colon_and_newline_at_zero_temperature(
+        const llama_model * model) {
+    const auto colon_tokens = common_tokenize(
+        llama_model_get_vocab(model), ":", false, false);
+    require(colon_tokens.size() == 1, "test vocabulary does not have one colon token");
+    const llama_token colon = colon_tokens.front();
+
+    const auto newline_tokens = common_tokenize(
+        llama_model_get_vocab(model), "\n", false, false);
+    require(!newline_tokens.empty(), "test vocabulary does not tokenize newline");
+    const llama_token newline = newline_tokens.back();
+    require(
+        common_token_to_piece(llama_model_get_vocab(model), newline, true) == "\n",
+        "test vocabulary newline token does not decode to newline");
+
+    for (const auto delimiter : {colon, newline}) {
+        common_sampler * sampler = make_breaker_sampler(model, delimiter, {"\"", "*"});
+        std::array<llama_token_data, 2> candidates {{
+            {delimiter,   10.0f, 0.0f},
+            {TOKEN_OTHER,  9.0f, 0.0f},
+        }};
+        auto cur_p = as_array(candidates);
+        require(
+            common_sampler_sample_greedy(sampler, nullptr, cur_p) == TOKEN_OTHER,
+            "quote/star-only breakers did not penalize a removed delimiter");
+        require(
+            candidates[0].logit < candidates[1].logit,
+            "quote/star-only breakers did not reduce a removed delimiter logit");
+        common_sampler_free(sampler);
+    }
+}
+
 } // namespace
 
 int main(int argc, char ** argv) {
@@ -231,6 +263,7 @@ int main(int argc, char ** argv) {
     test_absent_dry_preserves_zero_temperature_greedy(model);
     test_colon_breaker_exempts_repeated_colon_at_zero_temperature(model);
     test_newline_breaker_exempts_repeated_newline_at_zero_temperature(model);
+    test_quote_star_breakers_penalize_colon_and_newline_at_zero_temperature(model);
 
     llama_free_model(model);
     llama_backend_free();
