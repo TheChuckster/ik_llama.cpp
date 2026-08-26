@@ -53,13 +53,13 @@ common_sampler * make_sampler(
     return sampler;
 }
 
-common_sampler * make_colon_sampler(
+common_sampler * make_breaker_sampler(
         const llama_model * model,
-        llama_token colon,
+        llama_token breaker,
         std::vector<std::string> sequence_breakers) {
     common_sampler * sampler = make_sampler(
         model, 0.0f, 2.0f, true, std::move(sequence_breakers));
-    for (const llama_token token : {TOKEN_A, TOKEN_B, colon, TOKEN_A, TOKEN_B}) {
+    for (const llama_token token : {TOKEN_A, TOKEN_B, breaker, TOKEN_A, TOKEN_B}) {
         common_sampler_accept(sampler, nullptr, token, true);
     }
     return sampler;
@@ -146,7 +146,7 @@ void test_colon_breaker_exempts_repeated_colon_at_zero_temperature(
     require(colon_tokens.size() == 1, "test vocabulary does not have one colon token");
     const llama_token colon = colon_tokens.front();
 
-    common_sampler * without_breaker = make_colon_sampler(model, colon, {});
+    common_sampler * without_breaker = make_breaker_sampler(model, colon, {});
     std::array<llama_token_data, 2> penalized_candidates {{
         {colon,       10.0f, 0.0f},
         {TOKEN_OTHER,  9.0f, 0.0f},
@@ -160,7 +160,7 @@ void test_colon_breaker_exempts_repeated_colon_at_zero_temperature(
         "colon logit was not reduced when absent from the DRY breakers");
     common_sampler_free(without_breaker);
 
-    common_sampler * with_breaker = make_colon_sampler(model, colon, {":"});
+    common_sampler * with_breaker = make_breaker_sampler(model, colon, {":"});
     std::array<llama_token_data, 2> exempt_candidates {{
         {colon,       10.0f, 0.0f},
         {TOKEN_OTHER,  9.0f, 0.0f},
@@ -172,6 +172,45 @@ void test_colon_breaker_exempts_repeated_colon_at_zero_temperature(
     require(
         exempt_candidates[0].logit == 10.0f,
         "configured colon breaker changed the repeated colon logit");
+    common_sampler_free(with_breaker);
+}
+
+void test_newline_breaker_exempts_repeated_newline_at_zero_temperature(
+        const llama_model * model) {
+    const auto newline_tokens = common_tokenize(
+        llama_model_get_vocab(model), "\n", false, false);
+    require(!newline_tokens.empty(), "test vocabulary does not tokenize newline");
+    const llama_token newline = newline_tokens.back();
+    require(
+        common_token_to_piece(llama_model_get_vocab(model), newline, true) == "\n",
+        "test vocabulary newline token does not decode to newline");
+
+    common_sampler * without_breaker = make_breaker_sampler(model, newline, {});
+    std::array<llama_token_data, 2> penalized_candidates {{
+        {newline,     10.0f, 0.0f},
+        {TOKEN_OTHER,  9.0f, 0.0f},
+    }};
+    auto penalized = as_array(penalized_candidates);
+    require(
+        common_sampler_sample_greedy(without_breaker, nullptr, penalized) == TOKEN_OTHER,
+        "newline was not penalized when absent from the DRY breakers");
+    require(
+        penalized_candidates[0].logit < penalized_candidates[1].logit,
+        "newline logit was not reduced when absent from the DRY breakers");
+    common_sampler_free(without_breaker);
+
+    common_sampler * with_breaker = make_breaker_sampler(model, newline, {"\n"});
+    std::array<llama_token_data, 2> exempt_candidates {{
+        {newline,     10.0f, 0.0f},
+        {TOKEN_OTHER,  9.0f, 0.0f},
+    }};
+    auto exempt = as_array(exempt_candidates);
+    require(
+        common_sampler_sample_greedy(with_breaker, nullptr, exempt) == newline,
+        "configured newline breaker did not preserve the repeated newline");
+    require(
+        exempt_candidates[0].logit == 10.0f,
+        "configured newline breaker changed the repeated newline logit");
     common_sampler_free(with_breaker);
 }
 
@@ -191,6 +230,7 @@ int main(int argc, char ** argv) {
     test_disabled_dry_preserves_zero_temperature_greedy(model);
     test_absent_dry_preserves_zero_temperature_greedy(model);
     test_colon_breaker_exempts_repeated_colon_at_zero_temperature(model);
+    test_newline_breaker_exempts_repeated_newline_at_zero_temperature(model);
 
     llama_free_model(model);
     llama_backend_free();
