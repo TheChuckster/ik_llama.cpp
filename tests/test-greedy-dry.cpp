@@ -1,10 +1,13 @@
 #include "get-model.h"
+#include "common.h"
 #include "sampling.h"
 
 #include <array>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <string>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -21,7 +24,12 @@ void require(bool condition, const char * message) {
     }
 }
 
-common_sampler * make_sampler(const llama_model * model, float temp, float dry_multiplier, bool include_dry) {
+common_sampler * make_sampler(
+        const llama_model * model,
+        float temp,
+        float dry_multiplier,
+        bool include_dry,
+        std::vector<std::string> sequence_breakers = {}) {
     common_params_sampling params;
     params.temp = temp;
     params.total_context_size = 64;
@@ -29,7 +37,7 @@ common_sampler * make_sampler(const llama_model * model, float temp, float dry_m
     params.dry_base = 1.75f;
     params.dry_allowed_length = 2;
     params.dry_penalty_last_n = -1;
-    params.dry_sequence_breakers.clear();
+    params.dry_sequence_breakers = std::move(sequence_breakers);
     params.samplers_sequence = include_dry
         ? std::vector<llama_sampler_type>{llama_sampler_type::DRY}
         : std::vector<llama_sampler_type>{llama_sampler_type::TOP_K, llama_sampler_type::TEMPERATURE};
@@ -45,6 +53,18 @@ common_sampler * make_sampler(const llama_model * model, float temp, float dry_m
     return sampler;
 }
 
+common_sampler * make_colon_sampler(
+        const llama_model * model,
+        llama_token colon,
+        std::vector<std::string> sequence_breakers) {
+    common_sampler * sampler = make_sampler(
+        model, 0.0f, 2.0f, true, std::move(sequence_breakers));
+    for (const llama_token token : {TOKEN_A, TOKEN_B, colon, TOKEN_A, TOKEN_B}) {
+        common_sampler_accept(sampler, nullptr, token, true);
+    }
+    return sampler;
+}
+
 std::array<llama_token_data, 3> make_candidates() {
     return {{
         {TOKEN_REPEAT, 10.0f, 0.0f},
@@ -53,7 +73,8 @@ std::array<llama_token_data, 3> make_candidates() {
     }};
 }
 
-llama_token_data_array as_array(std::array<llama_token_data, 3> & candidates) {
+template <size_t N>
+llama_token_data_array as_array(std::array<llama_token_data, N> & candidates) {
     return {candidates.data(), candidates.size(), -1, false};
 }
 
@@ -118,6 +139,42 @@ void test_absent_dry_preserves_zero_temperature_greedy(const llama_model * model
     common_sampler_free(sampler);
 }
 
+void test_colon_breaker_exempts_repeated_colon_at_zero_temperature(
+        const llama_model * model) {
+    const auto colon_tokens = common_tokenize(
+        llama_model_get_vocab(model), ":", false, false);
+    require(colon_tokens.size() == 1, "test vocabulary does not have one colon token");
+    const llama_token colon = colon_tokens.front();
+
+    common_sampler * without_breaker = make_colon_sampler(model, colon, {});
+    std::array<llama_token_data, 2> penalized_candidates {{
+        {colon,       10.0f, 0.0f},
+        {TOKEN_OTHER,  9.0f, 0.0f},
+    }};
+    auto penalized = as_array(penalized_candidates);
+    require(
+        common_sampler_sample_greedy(without_breaker, nullptr, penalized) == TOKEN_OTHER,
+        "colon was not penalized when absent from the DRY breakers");
+    require(
+        penalized_candidates[0].logit < penalized_candidates[1].logit,
+        "colon logit was not reduced when absent from the DRY breakers");
+    common_sampler_free(without_breaker);
+
+    common_sampler * with_breaker = make_colon_sampler(model, colon, {":"});
+    std::array<llama_token_data, 2> exempt_candidates {{
+        {colon,       10.0f, 0.0f},
+        {TOKEN_OTHER,  9.0f, 0.0f},
+    }};
+    auto exempt = as_array(exempt_candidates);
+    require(
+        common_sampler_sample_greedy(with_breaker, nullptr, exempt) == colon,
+        "configured colon breaker did not preserve the repeated colon");
+    require(
+        exempt_candidates[0].logit == 10.0f,
+        "configured colon breaker changed the repeated colon logit");
+    common_sampler_free(with_breaker);
+}
+
 } // namespace
 
 int main(int argc, char ** argv) {
@@ -133,6 +190,7 @@ int main(int argc, char ** argv) {
     test_negative_temperature_dry_changes_argmax_and_computes_probabilities(model);
     test_disabled_dry_preserves_zero_temperature_greedy(model);
     test_absent_dry_preserves_zero_temperature_greedy(model);
+    test_colon_breaker_exempts_repeated_colon_at_zero_temperature(model);
 
     llama_free_model(model);
     llama_backend_free();
