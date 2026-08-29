@@ -788,23 +788,28 @@ value member_expression::execute_impl(context & ctx) {
         }
     } else {
         // syntax: obj.prop
-        if (!is_stmt<identifier>(this->property)) {
-            throw std::runtime_error("Static member property must be an identifier");
-        }
-        property = mk_val<value_string>(cast_stmt<identifier>(this->property)->val);
-        std::string prop = property->as_string().str();
-        JJ_DEBUG("Member expression, object type %s, static property '%s'", object->type().c_str(), prop.c_str());
+        if (is_stmt<identifier>(this->property)) {
+            property = mk_val<value_string>(cast_stmt<identifier>(this->property)->val);
+            std::string prop = property->as_string().str();
+            JJ_DEBUG("Member expression, object type %s, static property '%s'", object->type().c_str(), prop.c_str());
 
-        // behavior of jinja2: obj having prop as a built-in function AND 'prop', as an object key,
-        // then obj.prop returns the built-in function, not the property value.
-        // while obj['prop'] returns the property value.
-        // example: {"obj": {"items": 123}} -> obj.items is the built-in function, obj['items'] is 123
+            // behavior of jinja2: obj having prop as a built-in function AND 'prop', as an object key,
+            // then obj.prop returns the built-in function, not the property value.
+            // while obj['prop'] returns the property value.
+            // example: {"obj": {"items": 123}} -> obj.items is the built-in function, obj['items'] is 123
 
-        value val = try_builtin_func(ctx, prop, object, true);
-        if (!is_val<value_undefined>(val)) {
-            return val;
+            value val = try_builtin_func(ctx, prop, object, true);
+            if (!is_val<value_undefined>(val)) {
+                return val;
+            }
+            // else, fallthrough to normal property access below
+        } else if (is_stmt<integer_literal>(this->property)) {
+            // Standard Jinja accepts numeric dot notation (for example, messages.0.type)
+            // as an array index. Some official model chat templates use this spelling.
+            property = this->property->execute(ctx);
+        } else {
+            throw std::runtime_error("Static member property must be an identifier or integer");
         }
-        // else, fallthrough to normal property access below
     }
 
     JJ_DEBUG("Member expression on object type %s, property type %s", object->type().c_str(), property->type().c_str());

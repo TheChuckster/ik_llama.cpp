@@ -423,6 +423,18 @@ static void test_expressions(testing & t) {
         "b"
     );
 
+    test_template(t, "array access with numeric dot notation",
+        "{{ items.1 }}",
+        {{"items", json::array({"a", "b", "c"})}},
+        "b"
+    );
+
+    test_template(t, "chained array access with numeric dot notation",
+        "{{ messages.0.type }}",
+        {{"messages", json::array({json{{"type", "text"}}})}},
+        "text"
+    );
+
     test_template(t, "array negative access",
         "{{ items[-1] }}",
         {{"items", json::array({"a", "b", "c"})}},
